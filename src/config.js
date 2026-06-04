@@ -8,7 +8,18 @@ function numberEnv(name, fallback) {
 function boolEnv(name, fallback = false) {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
-  return raw === 'true';
+
+  const value = String(raw).trim().toLowerCase();
+
+  if (value === 'true' || value === '1' || value === 'yes' || value === 'on') {
+    return true;
+  }
+
+  if (value === 'false' || value === '0' || value === 'no' || value === 'off') {
+    return false;
+  }
+
+  return fallback;
 }
 
 const config = {

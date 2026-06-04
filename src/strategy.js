@@ -10,14 +10,14 @@ function numberEnv(name, fallback) {
 }
 
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 25),
+  evaluateTopN: numberEnv('EVALUATE_TOP_N', 80),
   maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
   buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 15),
 
-  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 4),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 22),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 24),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -3),
+  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 3),
+  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 18),
+  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 22),
+  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -2.5),
 
   trailingStartRate: numberEnv('TRAILING_START_RATE', 1.2),
   trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.8),
@@ -61,7 +61,7 @@ function analyzePricePoints(points, fallbackPrice) {
   const high = Math.max(...valid, last);
   const low = Math.min(...valid, last);
 
-  // 최근 4포인트 기준 단기 모멘텀
+  // 최근 4포인트 기준 초단기 모멘텀
   const shortBase = valid[Math.max(0, valid.length - 4)];
 
   const momentum1h = percentChange(first, last);
@@ -170,7 +170,6 @@ function getSellSignals(portfolio) {
     }
   }
 
-  // 이미 판 종목은 추적 데이터 삭제
   for (const stockId of holdingFirstSeenAt.keys()) {
     if (!currentHoldingIds.has(stockId)) {
       holdingFirstSeenAt.delete(stockId);
@@ -210,8 +209,9 @@ function preFilterCandidates(stocks, portfolio) {
       if (!Number.isFinite(currentPrice)) return false;
       if (currentPrice <= 0) return false;
 
-      // 너무 이미 오른 종목 제외
+      // 1day 등락률은 너무 극단적인 종목만 제외하는 용도로만 사용
       if (stock.changeRate > config.maxChangeRateOnEntry) return false;
+      if (stock.changeRate < -20) return false;
 
       const bufferedPrice = Math.ceil(
         currentPrice * (1 + config.buyPriceBufferRate / 100)
@@ -227,7 +227,19 @@ function preFilterCandidates(stocks, portfolio) {
 
       return true;
     })
-    .sort((a, b) => b.changeRate - a.changeRate)
+    .sort((a, b) => {
+      // changeRate 높은 순 몰빵 방지.
+      // LIVE 종목을 조금 우선하고, 그다음은 움직임 있는 종목을 넓게 잡음.
+      const aLive = a.isLive ? 1 : 0;
+      const bLive = b.isLive ? 1 : 0;
+
+      if (bLive !== aLive) return bLive - aLive;
+
+      const aMovement = Math.min(Math.abs(Number(a.changeRate) || 0), 100);
+      const bMovement = Math.min(Math.abs(Number(b.changeRate) || 0), 100);
+
+      return bMovement - aMovement;
+    })
     .slice(0, algo.evaluateTopN);
 }
 
@@ -253,12 +265,12 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         momentum1h >= algo.minMomentum1h &&
         momentum1h <= algo.maxMomentum1h;
 
-      // 단타형: 최근 단기 상승이 약하면 제외
+      // 단타형: 최근 몇 포인트가 확실히 오르는 종목만
       const shortMomentumOk = momentumShort >= config.minShortMomentum;
 
       const volatilityOk = volatility1h <= algo.maxVolatility1h;
 
-      // 고점에서 많이 밀린 종목 제외
+      // 고점 대비 많이 밀린 종목은 추세 꺾인 걸로 보고 제외
       const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
       if (!momentumOk || !shortMomentumOk || !volatilityOk || !pullbackOk) {
@@ -267,25 +279,30 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 
       let score = 0;
 
-      // 단타형: 1시간 전체보다 최근 단기 모멘텀 비중을 높임
-      score += momentum1h * 1.0;
-      score += momentumShort * 2.0;
-      score += stock.changeRate * 0.02;
+      // 핵심 변경:
+      // 1day changeRate 비중 거의 제거
+      // 1h와 short 모멘텀에 강한 가중치
+      score += momentum1h * 1.4;
+      score += momentumShort * 3.0;
+      score += stock.changeRate * 0.003;
 
       if (stock.isLive) {
         score += 0.5;
       }
 
+      // 변동성 과하면 감점
       if (volatility1h > 18) {
         score -= (volatility1h - 18) * 0.35;
       }
 
-      if (pullbackFromHigh < -2) {
-        score -= Math.abs(pullbackFromHigh + 2) * 0.8;
+      // 고점에서 살짝만 꺾여도 강하게 감점
+      if (pullbackFromHigh < -1.5) {
+        score -= Math.abs(pullbackFromHigh + 1.5) * 1.2;
       }
 
-      if (stock.changeRate > 60) {
-        score -= (stock.changeRate - 60) * 0.12;
+      // 하루 기준 과열 종목은 약하게만 감점
+      if (stock.changeRate > 80) {
+        score -= (stock.changeRate - 80) * 0.05;
       }
 
       if (score < algo.buyScoreThreshold) {
