@@ -197,6 +197,23 @@ function analyzePricePoints(points, fallbackPrice) {
   };
 }
 
+function getAdaptiveBuyQuantity(stock, dividendMode) {
+  const price = Number(stock.currentPrice || 0);
+
+  if (dividendMode) {
+    return algo.dividendBuyQuantity;
+  }
+
+  const multiBuyPriceLimit = numberEnv('MULTI_BUY_PRICE_LIMIT', 70000);
+  const multiBuyQuantity = numberEnv('MULTI_BUY_QUANTITY', 2);
+
+  if (price > 0 && price <= multiBuyPriceLimit) {
+    return Math.max(config.buyQuantity, multiBuyQuantity);
+  }
+
+  return config.buyQuantity;
+}
+
 function updateLiveTransitions(stocks) {
   const now = Date.now();
 
