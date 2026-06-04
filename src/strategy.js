@@ -11,22 +11,26 @@ function numberEnv(name, fallback) {
 }
 
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 60),
+  evaluateTopN: numberEnv('EVALUATE_TOP_N', 80),
   maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
-  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 18),
+  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 13),
 
-  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 2),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 14),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 16),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -1.2),
+  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 1.5),
+  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 20),
+  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 24),
+  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -2.5),
 
   trailingStartRate: numberEnv('TRAILING_START_RATE', 1.0),
-  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.6),
+  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.8),
 
-  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 120000),
+  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 160000),
   buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 2),
   buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 60000),
-  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', -0.1),
+  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', -0.3),
+
+  priceFetchConcurrency: numberEnv('PRICE_FETCH_CONCURRENCY', 8),
+  confirmCandidatesN: numberEnv('CONFIRM_CANDIDATES_N', 5),
+  waitLogTopN: numberEnv('WAIT_LOG_TOP_N', 5),
 };
 
 function canTrade(stockId) {
@@ -218,10 +222,8 @@ function preFilterCandidates(stocks, portfolio) {
       if (!Number.isFinite(currentPrice)) return false;
       if (currentPrice <= 0) return false;
 
-      // 비싼 종목은 1주만 사도 총자산 변동이 너무 커서 제외
       if (currentPrice > algo.maxEntryPrice) return false;
 
-      // 1day 등락률은 너무 극단적인 종목만 제외
       if (stock.changeRate > config.maxChangeRateOnEntry) return false;
       if (stock.changeRate < -20) return false;
 
@@ -277,118 +279,161 @@ function cleanupBuyConfirm() {
   }
 }
 
+async function mapLimit(items, limit, mapper) {
+  const results = new Array(items.length);
+  let index = 0;
+
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (index < items.length) {
+        const currentIndex = index++;
+        results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+      }
+    }
+  );
+
+  await Promise.all(workers);
+  return results;
+}
+
 async function getBuySignals(stocks, portfolio, getStockPrices) {
-  const signals = [];
   const candidates = preFilterCandidates(stocks, portfolio);
 
   cleanupBuyConfirm();
 
-  for (const stock of candidates) {
-    try {
-      const priceData = await getStockPrices(stock.id, '1h');
-      const analysis = analyzePricePoints(priceData.points, stock.currentPrice);
+  const analyzed = await mapLimit(
+    candidates,
+    algo.priceFetchConcurrency,
+    async stock => {
+      try {
+        const priceData = await getStockPrices(stock.id, '1h');
+        const analysis = analyzePricePoints(priceData.points, stock.currentPrice);
 
-      if (!analysis) continue;
+        if (!analysis) return null;
 
-      const {
-        momentum1h,
-        momentumShort,
-        momentumMicro,
-        pullbackFromHigh,
-        volatility1h,
-      } = analysis;
+        const {
+          momentum1h,
+          momentumShort,
+          momentumMicro,
+          pullbackFromHigh,
+          volatility1h,
+        } = analysis;
 
-      const momentumOk =
-        momentum1h >= algo.minMomentum1h &&
-        momentum1h <= algo.maxMomentum1h;
+        const momentumOk =
+          momentum1h >= algo.minMomentum1h &&
+          momentum1h <= algo.maxMomentum1h;
 
-      const shortMomentumOk = momentumShort >= config.minShortMomentum;
+        const shortMomentumOk = momentumShort >= config.minShortMomentum;
+        const microMomentumOk = momentumMicro >= algo.minMicroMomentum;
+        const volatilityOk = volatility1h <= algo.maxVolatility1h;
+        const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
-      // 방금 전 틱이 꺾인 종목은 바로 안 삼
-      const microMomentumOk = momentumMicro >= algo.minMicroMomentum;
+        if (
+          !momentumOk ||
+          !shortMomentumOk ||
+          !microMomentumOk ||
+          !volatilityOk ||
+          !pullbackOk
+        ) {
+          return null;
+        }
 
-      const volatilityOk = volatility1h <= algo.maxVolatility1h;
-      const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
+        let score = 0;
 
-      if (
-        !momentumOk ||
-        !shortMomentumOk ||
-        !microMomentumOk ||
-        !volatilityOk ||
-        !pullbackOk
-      ) {
-        continue;
+        score += momentum1h * 1.2;
+        score += momentumShort * 3.0;
+        score += momentumMicro * 2.0;
+        score += stock.changeRate * 0.001;
+
+        if (stock.isLive) {
+          score += 0.3;
+        }
+
+        if (volatility1h > 12) {
+          score -= (volatility1h - 12) * 0.45;
+        }
+
+        if (pullbackFromHigh < -0.8) {
+          score -= Math.abs(pullbackFromHigh + 0.8) * 1.5;
+        }
+
+        if (stock.changeRate > 80) {
+          score -= (stock.changeRate - 80) * 0.03;
+        }
+
+        if (score < algo.buyScoreThreshold) {
+          return null;
+        }
+
+        return {
+          type: 'BUY',
+          reason:
+            `단타 점수 ${score.toFixed(2)} / ` +
+            `1h ${momentum1h.toFixed(2)}% / ` +
+            `short ${momentumShort.toFixed(2)}% / ` +
+            `micro ${momentumMicro.toFixed(2)}% / ` +
+            `vol ${volatility1h.toFixed(2)}% / ` +
+            `high ${pullbackFromHigh.toFixed(2)}%`,
+          stockId: stock.id,
+          stockName: stock.channelName,
+          quantity: config.buyQuantity,
+          price: stock.currentPrice,
+          score,
+          momentum1h,
+          momentumShort,
+          momentumMicro,
+          pullbackFromHigh,
+        };
+      } catch (err) {
+        console.log(`[PRICE ERROR] ${stock.channelName} / ${err.message}`);
+        return null;
       }
+    }
+  );
 
-      let score = 0;
+  const ranked = analyzed
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, algo.confirmCandidatesN);
 
-      // 1day changeRate 거의 배제
-      // 1h, short, micro 중심
-      score += momentum1h * 1.2;
-      score += momentumShort * 3.0;
-      score += momentumMicro * 2.0;
-      score += stock.changeRate * 0.001;
+  const signals = [];
 
-      if (stock.isLive) {
-        score += 0.3;
-      }
+  for (let i = 0; i < ranked.length; i++) {
+    const signal = ranked[i];
 
-      if (volatility1h > 12) {
-        score -= (volatility1h - 12) * 0.45;
-      }
+    const confirmCount = updateBuyConfirm(signal.stockId);
 
-      if (pullbackFromHigh < -0.8) {
-        score -= Math.abs(pullbackFromHigh + 0.8) * 1.5;
-      }
-
-      if (stock.changeRate > 80) {
-        score -= (stock.changeRate - 80) * 0.03;
-      }
-
-      if (score < algo.buyScoreThreshold) {
-        continue;
-      }
-
-      const confirmCount = updateBuyConfirm(stock.id);
-
-      if (confirmCount < algo.buyConfirmCount) {
+    if (confirmCount < algo.buyConfirmCount) {
+      if (i < algo.waitLogTopN) {
         console.log(
-          `[BUY WAIT] ${stock.channelName} 확인 대기 ` +
+          `[BUY WAIT] ${signal.stockName} ` +
           `${confirmCount}/${algo.buyConfirmCount} / ` +
-          `score ${score.toFixed(2)} / ` +
-          `1h ${momentum1h.toFixed(2)}% / ` +
-          `short ${momentumShort.toFixed(2)}% / ` +
-          `micro ${momentumMicro.toFixed(2)}% / ` +
-          `high ${pullbackFromHigh.toFixed(2)}%`
+          `score ${signal.score.toFixed(2)} / ` +
+          `1h ${signal.momentum1h.toFixed(2)}% / ` +
+          `short ${signal.momentumShort.toFixed(2)}% / ` +
+          `micro ${signal.momentumMicro.toFixed(2)}% / ` +
+          `high ${signal.pullbackFromHigh.toFixed(2)}%`
         );
-        continue;
       }
 
-      buyConfirmMap.delete(stock.id);
+      continue;
+    }
 
-      signals.push({
-        type: 'BUY',
-        reason:
-          `단타 점수 ${score.toFixed(2)} / ` +
-          `1h ${momentum1h.toFixed(2)}% / ` +
-          `short ${momentumShort.toFixed(2)}% / ` +
-          `micro ${momentumMicro.toFixed(2)}% / ` +
-          `vol ${volatility1h.toFixed(2)}% / ` +
-          `high ${pullbackFromHigh.toFixed(2)}%`,
-        stockId: stock.id,
-        stockName: stock.channelName,
-        quantity: config.buyQuantity,
-        price: stock.currentPrice,
-        score,
-      });
-    } catch (err) {
-      console.log(`[PRICE ERROR] ${stock.channelName} / ${err.message}`);
+    buyConfirmMap.delete(signal.stockId);
+
+    signals.push(signal);
+
+    if (signals.length >= algo.maxBuysPerLoop) {
+      break;
     }
   }
 
-  return signals
-    .sort((a, b) => b.score - a.score)
-    .slice(0, algo.maxBuysPerLoop);
+  console.log(
+    `[BUY DEBUG] candidates=${candidates.length} / ranked=${ranked.length} / signals=${signals.length}`
+  );
+
+  return signals;
 }
 
 function markSignalTraded(signal) {
