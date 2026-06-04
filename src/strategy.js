@@ -382,9 +382,18 @@ function getSellSignals(portfolio) {
 function preFilterCandidates(stocks, portfolio) {
   updateLiveTransitions(stocks);
 
+  // 전체 매수 잠금 조건 확인
+  // - 손절 연속 후 쉬는 시간
+  // - 최근 매수 후 글로벌 쿨다운
+  // - 보유 종목 중 손실 있으면 신규매수 보류
+  if (!canOpenNewPosition(portfolio)) {
+    return [];
+  }
+
   const holdings = makeHoldingMap(portfolio);
   const positionCount = portfolio.holdings?.length || 0;
   const dividendMode = isDividendMode();
+
   const maxPositions = dividendMode
     ? algo.dividendMaxPositions
     : config.maxPositions;
@@ -587,7 +596,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         }
 
         const quantity = getAdaptiveBuyQuantity(stock, dividendMode);
-        
+
         return {
           type: 'BUY',
           reason:
