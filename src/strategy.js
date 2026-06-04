@@ -3,6 +3,7 @@ const config = require('./config');
 const lastTradeAt = new Map();
 const holdingPeaks = new Map();
 const holdingFirstSeenAt = new Map();
+const buyConfirmMap = new Map();
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -10,17 +11,22 @@ function numberEnv(name, fallback) {
 }
 
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 80),
+  evaluateTopN: numberEnv('EVALUATE_TOP_N', 60),
   maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
-  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 15),
+  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 18),
 
-  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 3),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 18),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 22),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -2.5),
+  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 2),
+  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 14),
+  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 16),
+  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -1.2),
 
-  trailingStartRate: numberEnv('TRAILING_START_RATE', 1.2),
-  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.8),
+  trailingStartRate: numberEnv('TRAILING_START_RATE', 1.0),
+  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.6),
+
+  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 120000),
+  buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 2),
+  buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 60000),
+  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', -0.1),
 };
 
 function canTrade(stockId) {
@@ -50,6 +56,7 @@ function percentChange(from, to) {
 function analyzePricePoints(points, fallbackPrice) {
   const valid = (points || [])
     .filter(p => Number.isFinite(Number(p.price)))
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
     .map(p => Number(p.price));
 
   if (valid.length < 5) {
@@ -61,11 +68,12 @@ function analyzePricePoints(points, fallbackPrice) {
   const high = Math.max(...valid, last);
   const low = Math.min(...valid, last);
 
-  // 최근 4포인트 기준 초단기 모멘텀
   const shortBase = valid[Math.max(0, valid.length - 4)];
+  const microBase = valid[Math.max(0, valid.length - 2)];
 
   const momentum1h = percentChange(first, last);
   const momentumShort = percentChange(shortBase, last);
+  const momentumMicro = percentChange(microBase, last);
   const pullbackFromHigh = percentChange(high, last);
   const volatility1h = percentChange(low, high);
 
@@ -76,6 +84,7 @@ function analyzePricePoints(points, fallbackPrice) {
     low,
     momentum1h,
     momentumShort,
+    momentumMicro,
     pullbackFromHigh,
     volatility1h,
   };
@@ -209,7 +218,10 @@ function preFilterCandidates(stocks, portfolio) {
       if (!Number.isFinite(currentPrice)) return false;
       if (currentPrice <= 0) return false;
 
-      // 1day 등락률은 너무 극단적인 종목만 제외하는 용도로만 사용
+      // 비싼 종목은 1주만 사도 총자산 변동이 너무 커서 제외
+      if (currentPrice > algo.maxEntryPrice) return false;
+
+      // 1day 등락률은 너무 극단적인 종목만 제외
       if (stock.changeRate > config.maxChangeRateOnEntry) return false;
       if (stock.changeRate < -20) return false;
 
@@ -217,10 +229,7 @@ function preFilterCandidates(stocks, portfolio) {
         currentPrice * (1 + config.buyPriceBufferRate / 100)
       );
 
-      // 전체 잔고로도 못 사면 제외
       if (usableCash < bufferedPrice) return false;
-
-      // 1회 거래 한도로도 못 사면 제외
       if (maxTradeCash < bufferedPrice) return false;
 
       if (!canTrade(stock.id)) return false;
@@ -228,8 +237,6 @@ function preFilterCandidates(stocks, portfolio) {
       return true;
     })
     .sort((a, b) => {
-      // changeRate 높은 순 몰빵 방지.
-      // LIVE 종목을 조금 우선하고, 그다음은 움직임 있는 종목을 넓게 잡음.
       const aLive = a.isLive ? 1 : 0;
       const bLive = b.isLive ? 1 : 0;
 
@@ -243,9 +250,38 @@ function preFilterCandidates(stocks, portfolio) {
     .slice(0, algo.evaluateTopN);
 }
 
+function updateBuyConfirm(stockId) {
+  const now = Date.now();
+  const prev = buyConfirmMap.get(stockId);
+
+  const count =
+    prev && now - prev.lastSeenAt <= algo.buyConfirmWindowMs
+      ? prev.count + 1
+      : 1;
+
+  buyConfirmMap.set(stockId, {
+    count,
+    lastSeenAt: now,
+  });
+
+  return count;
+}
+
+function cleanupBuyConfirm() {
+  const now = Date.now();
+
+  for (const [stockId, value] of buyConfirmMap.entries()) {
+    if (now - value.lastSeenAt > algo.buyConfirmWindowMs) {
+      buyConfirmMap.delete(stockId);
+    }
+  }
+}
+
 async function getBuySignals(stocks, portfolio, getStockPrices) {
   const signals = [];
   const candidates = preFilterCandidates(stocks, portfolio);
+
+  cleanupBuyConfirm();
 
   for (const stock of candidates) {
     try {
@@ -257,6 +293,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
       const {
         momentum1h,
         momentumShort,
+        momentumMicro,
         pullbackFromHigh,
         volatility1h,
       } = analysis;
@@ -265,49 +302,69 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         momentum1h >= algo.minMomentum1h &&
         momentum1h <= algo.maxMomentum1h;
 
-      // 단타형: 최근 몇 포인트가 확실히 오르는 종목만
       const shortMomentumOk = momentumShort >= config.minShortMomentum;
 
-      const volatilityOk = volatility1h <= algo.maxVolatility1h;
+      // 방금 전 틱이 꺾인 종목은 바로 안 삼
+      const microMomentumOk = momentumMicro >= algo.minMicroMomentum;
 
-      // 고점 대비 많이 밀린 종목은 추세 꺾인 걸로 보고 제외
+      const volatilityOk = volatility1h <= algo.maxVolatility1h;
       const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
-      if (!momentumOk || !shortMomentumOk || !volatilityOk || !pullbackOk) {
+      if (
+        !momentumOk ||
+        !shortMomentumOk ||
+        !microMomentumOk ||
+        !volatilityOk ||
+        !pullbackOk
+      ) {
         continue;
       }
 
       let score = 0;
 
-      // 핵심 변경:
-      // 1day changeRate 비중 거의 제거
-      // 1h와 short 모멘텀에 강한 가중치
-      score += momentum1h * 1.4;
+      // 1day changeRate 거의 배제
+      // 1h, short, micro 중심
+      score += momentum1h * 1.2;
       score += momentumShort * 3.0;
-      score += stock.changeRate * 0.003;
+      score += momentumMicro * 2.0;
+      score += stock.changeRate * 0.001;
 
       if (stock.isLive) {
-        score += 0.5;
+        score += 0.3;
       }
 
-      // 변동성 과하면 감점
-      if (volatility1h > 18) {
-        score -= (volatility1h - 18) * 0.35;
+      if (volatility1h > 12) {
+        score -= (volatility1h - 12) * 0.45;
       }
 
-      // 고점에서 살짝만 꺾여도 강하게 감점
-      if (pullbackFromHigh < -1.5) {
-        score -= Math.abs(pullbackFromHigh + 1.5) * 1.2;
+      if (pullbackFromHigh < -0.8) {
+        score -= Math.abs(pullbackFromHigh + 0.8) * 1.5;
       }
 
-      // 하루 기준 과열 종목은 약하게만 감점
       if (stock.changeRate > 80) {
-        score -= (stock.changeRate - 80) * 0.05;
+        score -= (stock.changeRate - 80) * 0.03;
       }
 
       if (score < algo.buyScoreThreshold) {
         continue;
       }
+
+      const confirmCount = updateBuyConfirm(stock.id);
+
+      if (confirmCount < algo.buyConfirmCount) {
+        console.log(
+          `[BUY WAIT] ${stock.channelName} 확인 대기 ` +
+          `${confirmCount}/${algo.buyConfirmCount} / ` +
+          `score ${score.toFixed(2)} / ` +
+          `1h ${momentum1h.toFixed(2)}% / ` +
+          `short ${momentumShort.toFixed(2)}% / ` +
+          `micro ${momentumMicro.toFixed(2)}% / ` +
+          `high ${pullbackFromHigh.toFixed(2)}%`
+        );
+        continue;
+      }
+
+      buyConfirmMap.delete(stock.id);
 
       signals.push({
         type: 'BUY',
@@ -315,6 +372,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           `단타 점수 ${score.toFixed(2)} / ` +
           `1h ${momentum1h.toFixed(2)}% / ` +
           `short ${momentumShort.toFixed(2)}% / ` +
+          `micro ${momentumMicro.toFixed(2)}% / ` +
           `vol ${volatility1h.toFixed(2)}% / ` +
           `high ${pullbackFromHigh.toFixed(2)}%`,
         stockId: stock.id,
