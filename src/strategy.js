@@ -6,33 +6,71 @@ const holdingPeaks = new Map();
 const holdingFirstSeenAt = new Map();
 const buyConfirmMap = new Map();
 
+// LIVE 전환 추적용
+const lastLiveState = new Map();
+const liveStartedAt = new Map();
+let liveStateSeeded = false;
+
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
 }
 
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 70),
+  evaluateTopN: numberEnv('EVALUATE_TOP_N', 100),
   maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
-  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 16),
+  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 13),
 
-  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 1.5),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 18),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 18),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -1.3),
+  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 1.2),
+  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 24),
+  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 24),
+  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -2.2),
 
   trailingStartRate: numberEnv('TRAILING_START_RATE', 0.9),
-  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.6),
+  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.7),
 
-  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 110000),
-  buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 3),
-  buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 90000),
-  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', 0.2),
+  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 140000),
+  buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 2),
+  buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 70000),
+  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', -0.1),
 
   priceFetchConcurrency: numberEnv('PRICE_FETCH_CONCURRENCY', 8),
-  confirmCandidatesN: numberEnv('CONFIRM_CANDIDATES_N', 4),
+  confirmCandidatesN: numberEnv('CONFIRM_CANDIDATES_N', 5),
   waitLogTopN: numberEnv('WAIT_LOG_TOP_N', 4),
+
+  liveTransitionBoost: numberEnv('LIVE_TRANSITION_BOOST', 8),
+  liveTransitionWindowMs: numberEnv('LIVE_TRANSITION_WINDOW_MS', 900000),
+  liveTransitionRelaxMomentum: numberEnv('LIVE_TRANSITION_RELAX_MOMENTUM', 0.7),
+  liveTransitionRelaxScore: numberEnv('LIVE_TRANSITION_RELAX_SCORE', 3),
+
+  dividendMaxPositions: numberEnv('DIVIDEND_MAX_POSITIONS', 3),
+  dividendBuyQuantity: numberEnv('DIVIDEND_BUY_QUANTITY', 2),
+  dividendStopLossRate: numberEnv('DIVIDEND_STOP_LOSS_RATE', -5),
+  dividendMinScore: numberEnv('DIVIDEND_MIN_SCORE', 10),
 };
+
+function nowKstMinutes() {
+  const now = new Date();
+  const kst = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  return kst.getHours() * 60 + kst.getMinutes();
+}
+
+function isDividendMode() {
+  const current = nowKstMinutes();
+
+  const start =
+    config.dividendModeStartHour * 60 + config.dividendModeStartMinute;
+
+  const end =
+    config.dividendModeEndHour * 60 + config.dividendModeEndMinute;
+
+  // 23:40 ~ 00:05처럼 자정 넘기는 구간
+  if (start > end) {
+    return current >= start || current <= end;
+  }
+
+  return current >= start && current <= end;
+}
 
 function canBuy(stockId) {
   const now = Date.now();
@@ -62,6 +100,19 @@ function makeHoldingMap(portfolio) {
   }
 
   return map;
+}
+
+function holdingValue(holding) {
+  return Number(holding.currentPrice || 0) * Number(holding.quantity || 0);
+}
+
+function getDividendTopHoldingIds(portfolio) {
+  return new Set(
+    [...(portfolio.holdings || [])]
+      .sort((a, b) => holdingValue(b) - holdingValue(a))
+      .slice(0, algo.dividendMaxPositions)
+      .map(h => h.stockId)
+  );
 }
 
 function percentChange(from, to) {
@@ -106,9 +157,45 @@ function analyzePricePoints(points, fallbackPrice) {
   };
 }
 
+function updateLiveTransitions(stocks) {
+  const now = Date.now();
+
+  for (const stock of stocks) {
+    const id = stock.id;
+    const currentLive = stock.isLive === true;
+    const prevLive = lastLiveState.get(id);
+
+    // 첫 루프에서는 현재 상태만 저장하고 전환으로 보지 않음
+    if (liveStateSeeded && prevLive === false && currentLive === true) {
+      liveStartedAt.set(id, now);
+    }
+
+    lastLiveState.set(id, currentLive);
+  }
+
+  liveStateSeeded = true;
+}
+
+function isLiveJustStarted(stockId) {
+  const startedAt = liveStartedAt.get(stockId);
+  if (!startedAt) return false;
+
+  return Date.now() - startedAt <= algo.liveTransitionWindowMs;
+}
+
+function getLiveAgeText(stockId) {
+  const startedAt = liveStartedAt.get(stockId);
+  if (!startedAt) return '';
+
+  const sec = Math.round((Date.now() - startedAt) / 1000);
+  return ` / live+${sec}s`;
+}
+
 function getSellSignals(portfolio) {
   const signals = [];
   const currentHoldingIds = new Set();
+  const dividendMode = isDividendMode();
+  const dividendTopIds = getDividendTopHoldingIds(portfolio);
 
   for (const holding of portfolio.holdings || []) {
     const stockId = holding.stockId;
@@ -129,10 +216,37 @@ function getSellSignals(portfolio) {
     const holdingMs = Date.now() - firstSeenAt;
     const peakDrawdown = percentChange(newPeak, currentPrice);
 
-    // 중요:
-    // 매도에는 쿨다운을 걸지 않는다.
-    // 단타에서 손절/익절은 즉시 나가야 함.
+    // 배당 모드:
+    // 상위 3개는 자정 배당을 위해 최대한 유지.
+    // 단, 큰 손실은 예외적으로 정리.
+    if (dividendMode) {
+      if (holding.profitRate <= algo.dividendStopLossRate) {
+        signals.push({
+          type: 'SELL',
+          reason: `배당 모드 예외 손절: ${holding.profitRate}%`,
+          stockId,
+          stockName: holding.stockName,
+          quantity: holding.quantity,
+        });
+        continue;
+      }
 
+      // 배당 상위 3개가 아닌 종목은 살짝 수익이면 정리해서 현금 확보
+      if (!dividendTopIds.has(stockId) && holding.profitRate >= 0.5) {
+        signals.push({
+          type: 'SELL',
+          reason: `배당 모드 비상위 정리: ${holding.profitRate}%`,
+          stockId,
+          stockName: holding.stockName,
+          quantity: holding.quantity,
+        });
+        continue;
+      }
+
+      continue;
+    }
+
+    // 일반 모드: 매도에는 쿨다운 없음. 손절/익절 즉시.
     if (holding.profitRate <= config.stopLossRate) {
       signals.push({
         type: 'SELL',
@@ -209,10 +323,16 @@ function getSellSignals(portfolio) {
 }
 
 function preFilterCandidates(stocks, portfolio) {
+  updateLiveTransitions(stocks);
+
   const holdings = makeHoldingMap(portfolio);
   const positionCount = portfolio.holdings?.length || 0;
+  const dividendMode = isDividendMode();
+  const maxPositions = dividendMode
+    ? algo.dividendMaxPositions
+    : config.maxPositions;
 
-  if (positionCount >= config.maxPositions) {
+  if (positionCount >= maxPositions) {
     return [];
   }
 
@@ -254,6 +374,11 @@ function preFilterCandidates(stocks, portfolio) {
       return true;
     })
     .sort((a, b) => {
+      const aJustLive = isLiveJustStarted(a.id) ? 1 : 0;
+      const bJustLive = isLiveJustStarted(b.id) ? 1 : 0;
+
+      if (bJustLive !== aJustLive) return bJustLive - aJustLive;
+
       const aLive = a.isLive ? 1 : 0;
       const bLive = b.isLive ? 1 : 0;
 
@@ -313,6 +438,7 @@ async function mapLimit(items, limit, mapper) {
 }
 
 async function getBuySignals(stocks, portfolio, getStockPrices) {
+  const dividendMode = isDividendMode();
   const candidates = preFilterCandidates(stocks, portfolio);
 
   cleanupBuyConfirm();
@@ -335,8 +461,20 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           volatility1h,
         } = analysis;
 
+        const justLive = isLiveJustStarted(stock.id);
+
+        const minMomentum1h = justLive
+          ? Math.max(0, algo.minMomentum1h - algo.liveTransitionRelaxMomentum)
+          : algo.minMomentum1h;
+
+        const minScore = dividendMode
+          ? Math.min(algo.buyScoreThreshold, algo.dividendMinScore)
+          : justLive
+            ? Math.max(5, algo.buyScoreThreshold - algo.liveTransitionRelaxScore)
+            : algo.buyScoreThreshold;
+
         const momentumOk =
-          momentum1h >= algo.minMomentum1h &&
+          momentum1h >= minMomentum1h &&
           momentum1h <= algo.maxMomentum1h;
 
         const shortMomentumOk = momentumShort >= config.minShortMomentum;
@@ -365,6 +503,16 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           score += 0.3;
         }
 
+        if (justLive) {
+          score += algo.liveTransitionBoost;
+        }
+
+        if (dividendMode) {
+          // 배당 모드에서는 현재가가 어느 정도 있는 종목이 유리함.
+          // 단 너무 비싼 종목은 maxEntryPrice에서 이미 제외.
+          score += Math.min(Number(stock.currentPrice || 0) / 20000, 5);
+        }
+
         if (volatility1h > 12) {
           score -= (volatility1h - 12) * 0.6;
         }
@@ -377,28 +525,35 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           score -= (stock.changeRate - 80) * 0.03;
         }
 
-        if (score < algo.buyScoreThreshold) {
+        if (score < minScore) {
           return null;
         }
+
+        const quantity = dividendMode
+          ? algo.dividendBuyQuantity
+          : config.buyQuantity;
 
         return {
           type: 'BUY',
           reason:
-            `단타 점수 ${score.toFixed(2)} / ` +
+            `${dividendMode ? '배당+단타' : '단타'} 점수 ${score.toFixed(2)} / ` +
             `1h ${momentum1h.toFixed(2)}% / ` +
             `short ${momentumShort.toFixed(2)}% / ` +
             `micro ${momentumMicro.toFixed(2)}% / ` +
             `vol ${volatility1h.toFixed(2)}% / ` +
-            `high ${pullbackFromHigh.toFixed(2)}%`,
+            `high ${pullbackFromHigh.toFixed(2)}%` +
+            `${justLive ? ' / LIVE 전환 감지' : ''}` +
+            `${getLiveAgeText(stock.id)}`,
           stockId: stock.id,
           stockName: stock.channelName,
-          quantity: config.buyQuantity,
+          quantity,
           price: stock.currentPrice,
           score,
           momentum1h,
           momentumShort,
           momentumMicro,
           pullbackFromHigh,
+          justLive,
         };
       } catch (err) {
         console.log(`[PRICE ERROR] ${stock.channelName} / ${err.message}`);
@@ -428,7 +583,8 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           `1h ${signal.momentum1h.toFixed(2)}% / ` +
           `short ${signal.momentumShort.toFixed(2)}% / ` +
           `micro ${signal.momentumMicro.toFixed(2)}% / ` +
-          `high ${signal.pullbackFromHigh.toFixed(2)}%`
+          `high ${signal.pullbackFromHigh.toFixed(2)}%` +
+          `${signal.justLive ? ' / LIVE 전환' : ''}`
         );
       }
 
@@ -436,7 +592,6 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
     }
 
     buyConfirmMap.delete(signal.stockId);
-
     signals.push(signal);
 
     if (signals.length >= algo.maxBuysPerLoop) {
@@ -445,7 +600,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
   }
 
   console.log(
-    `[BUY DEBUG] candidates=${candidates.length} / ranked=${ranked.length} / signals=${signals.length}`
+    `[BUY DEBUG] candidates=${candidates.length} / ranked=${ranked.length} / signals=${signals.length} / dividendMode=${dividendMode}`
   );
 
   return signals;
