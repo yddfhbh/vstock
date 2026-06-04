@@ -1,6 +1,7 @@
 const config = require('./config');
 
-const lastTradeAt = new Map();
+const lastBuyAt = new Map();
+const lastExitAt = new Map();
 const holdingPeaks = new Map();
 const holdingFirstSeenAt = new Map();
 const buyConfirmMap = new Map();
@@ -11,35 +12,46 @@ function numberEnv(name, fallback) {
 }
 
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 80),
+  evaluateTopN: numberEnv('EVALUATE_TOP_N', 70),
   maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
-  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 13),
+  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 16),
 
   minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 1.5),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 20),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 24),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -2.5),
+  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 18),
+  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 18),
+  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -1.3),
 
-  trailingStartRate: numberEnv('TRAILING_START_RATE', 1.0),
-  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.8),
+  trailingStartRate: numberEnv('TRAILING_START_RATE', 0.9),
+  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.6),
 
-  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 160000),
-  buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 2),
-  buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 60000),
-  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', -0.3),
+  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 110000),
+  buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 3),
+  buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 90000),
+  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', 0.2),
 
   priceFetchConcurrency: numberEnv('PRICE_FETCH_CONCURRENCY', 8),
-  confirmCandidatesN: numberEnv('CONFIRM_CANDIDATES_N', 5),
-  waitLogTopN: numberEnv('WAIT_LOG_TOP_N', 5),
+  confirmCandidatesN: numberEnv('CONFIRM_CANDIDATES_N', 4),
+  waitLogTopN: numberEnv('WAIT_LOG_TOP_N', 4),
 };
 
-function canTrade(stockId) {
-  const last = lastTradeAt.get(stockId) || 0;
-  return Date.now() - last >= config.tradeCooldownMs;
+function canBuy(stockId) {
+  const now = Date.now();
+  const lastBuy = lastBuyAt.get(stockId) || 0;
+  const lastExit = lastExitAt.get(stockId) || 0;
+  const last = Math.max(lastBuy, lastExit);
+
+  return now - last >= config.tradeCooldownMs;
 }
 
-function markTraded(stockId) {
-  lastTradeAt.set(stockId, Date.now());
+function markBought(stockId) {
+  lastBuyAt.set(stockId, Date.now());
+}
+
+function markSold(stockId) {
+  lastExitAt.set(stockId, Date.now());
+  holdingPeaks.delete(stockId);
+  holdingFirstSeenAt.delete(stockId);
+  buyConfirmMap.delete(stockId);
 }
 
 function makeHoldingMap(portfolio) {
@@ -103,9 +115,10 @@ function getSellSignals(portfolio) {
     currentHoldingIds.add(stockId);
 
     const currentPrice = Number(holding.currentPrice);
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+
     const prevPeak = holdingPeaks.get(stockId) || currentPrice;
     const newPeak = Math.max(prevPeak, currentPrice);
-
     holdingPeaks.set(stockId, newPeak);
 
     if (!holdingFirstSeenAt.has(stockId)) {
@@ -116,12 +129,14 @@ function getSellSignals(portfolio) {
     const holdingMs = Date.now() - firstSeenAt;
     const peakDrawdown = percentChange(newPeak, currentPrice);
 
-    if (!canTrade(stockId)) continue;
+    // 중요:
+    // 매도에는 쿨다운을 걸지 않는다.
+    // 단타에서 손절/익절은 즉시 나가야 함.
 
-    if (holding.profitRate >= config.takeProfitRate) {
+    if (holding.profitRate <= config.stopLossRate) {
       signals.push({
         type: 'SELL',
-        reason: `단타 익절: ${holding.profitRate}%`,
+        reason: `즉시 손절: ${holding.profitRate}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -129,10 +144,10 @@ function getSellSignals(portfolio) {
       continue;
     }
 
-    if (holding.profitRate <= config.stopLossRate) {
+    if (holding.profitRate >= config.takeProfitRate) {
       signals.push({
         type: 'SELL',
-        reason: `단타 손절: ${holding.profitRate}%`,
+        reason: `단타 익절: ${holding.profitRate}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -234,7 +249,7 @@ function preFilterCandidates(stocks, portfolio) {
       if (usableCash < bufferedPrice) return false;
       if (maxTradeCash < bufferedPrice) return false;
 
-      if (!canTrade(stock.id)) return false;
+      if (!canBuy(stock.id)) return false;
 
       return true;
     })
@@ -341,8 +356,8 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 
         let score = 0;
 
-        score += momentum1h * 1.2;
-        score += momentumShort * 3.0;
+        score += momentum1h * 1.0;
+        score += momentumShort * 2.5;
         score += momentumMicro * 2.0;
         score += stock.changeRate * 0.001;
 
@@ -351,11 +366,11 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         }
 
         if (volatility1h > 12) {
-          score -= (volatility1h - 12) * 0.45;
+          score -= (volatility1h - 12) * 0.6;
         }
 
         if (pullbackFromHigh < -0.8) {
-          score -= Math.abs(pullbackFromHigh + 0.8) * 1.5;
+          score -= Math.abs(pullbackFromHigh + 0.8) * 2.0;
         }
 
         if (stock.changeRate > 80) {
@@ -437,7 +452,14 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 }
 
 function markSignalTraded(signal) {
-  markTraded(signal.stockId);
+  if (signal.type === 'BUY') {
+    markBought(signal.stockId);
+    return;
+  }
+
+  if (signal.type === 'SELL') {
+    markSold(signal.stockId);
+  }
 }
 
 module.exports = {
