@@ -586,10 +586,8 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           return null;
         }
 
-        const quantity = dividendMode
-          ? algo.dividendBuyQuantity
-          : config.buyQuantity;
-
+        const quantity = getAdaptiveBuyQuantity(stock, dividendMode);
+        
         return {
           type: 'BUY',
           reason:
