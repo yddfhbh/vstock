@@ -54,6 +54,12 @@ const algo = {
   buyGlobalCooldownMs: numberEnv('BUY_GLOBAL_COOLDOWN_MS', 45000),
   lossPauseCount: numberEnv('LOSS_PAUSE_COUNT', 2),
   lossPauseMs: numberEnv('LOSS_PAUSE_MS', 180000),
+
+  dividendAggressiveStartHour: numberEnv('DIVIDEND_AGGRESSIVE_START_HOUR', 23),
+  dividendAggressiveStartMinute: numberEnv('DIVIDEND_AGGRESSIVE_START_MINUTE', 50),
+  dividendCashReserve: numberEnv('DIVIDEND_CASH_RESERVE', 30000),
+  dividendMaxBuyCashPerTradeRate: numberEnv('DIVIDEND_MAX_BUY_CASH_PER_TRADE_RATE', 60),
+  dividendAddBuyQuantity: numberEnv('DIVIDEND_ADD_BUY_QUANTITY', 3),
 };
 
 function nowKstMinutes() {
@@ -110,6 +116,18 @@ function isDividendMode() {
   }
 
   return current >= start && current <= end;
+}
+
+function isDividendAggressiveMode() {
+  if (!isDividendMode()) return false;
+
+  const current = nowKstMinutes();
+
+  const start =
+    algo.dividendAggressiveStartHour * 60 +
+    algo.dividendAggressiveStartMinute;
+
+  return current >= start;
 }
 
 function canBuy(stockId) {
@@ -382,33 +400,43 @@ function getSellSignals(portfolio) {
 function preFilterCandidates(stocks, portfolio) {
   updateLiveTransitions(stocks);
 
-  // 전체 매수 잠금 조건 확인
-  // - 손절 연속 후 쉬는 시간
-  // - 최근 매수 후 글로벌 쿨다운
-  // - 보유 종목 중 손실 있으면 신규매수 보류
-  if (!canOpenNewPosition(portfolio)) {
+  const dividendMode = isDividendMode();
+  const aggressiveDividendMode = isDividendAggressiveMode();
+
+  // 일반 모드에서는 매수 잠금 조건 적용
+  // 공격 배당 모드에서는 현금 소진을 위해 매수 잠금 일부 무시
+  if (!aggressiveDividendMode && !canOpenNewPosition(portfolio)) {
     return [];
   }
 
   const holdings = makeHoldingMap(portfolio);
   const positionCount = portfolio.holdings?.length || 0;
-  const dividendMode = isDividendMode();
 
   const maxPositions = dividendMode
     ? algo.dividendMaxPositions
     : config.maxPositions;
 
-  if (positionCount >= maxPositions) {
+  // 일반/배당 준비 모드에서는 최대 종목 수 도달 시 신규매수 중단
+  // 공격 배당 모드에서는 이미 보유한 종목 추가매수는 허용
+  if (!aggressiveDividendMode && positionCount >= maxPositions) {
     return [];
   }
 
+  const cashReserve = aggressiveDividendMode
+    ? algo.dividendCashReserve
+    : config.buyCashReserve;
+
+  const buyCashRate = aggressiveDividendMode
+    ? algo.dividendMaxBuyCashPerTradeRate
+    : config.maxBuyCashPerTradeRate;
+
   const usableCash = Math.max(
     0,
-    Number(portfolio.me.balance || 0) - config.buyCashReserve
+    Number(portfolio.me.balance || 0) - cashReserve
   );
 
   const maxTradeCash = Math.floor(
-    usableCash * (config.maxBuyCashPerTradeRate / 100)
+    usableCash * (buyCashRate / 100)
   );
 
   if (usableCash <= 0) return [];
@@ -416,8 +444,22 @@ function preFilterCandidates(stocks, portfolio) {
 
   return stocks
     .filter(stock => {
-      if (holdings.has(stock.id)) return false;
+      const alreadyHolding = holdings.has(stock.id);
+
       if (stock.isDelisted) return false;
+
+      // 일반 모드에서는 이미 보유 중인 종목 추가매수 금지
+      // 공격 배당 모드에서는 보유 종목 추가매수 허용
+      if (alreadyHolding && !aggressiveDividendMode) return false;
+
+      // 공격 배당 모드에서 이미 3종목 들고 있으면 새 종목은 금지하고 기존 보유 종목만 추가매수
+      if (
+        aggressiveDividendMode &&
+        positionCount >= maxPositions &&
+        !alreadyHolding
+      ) {
+        return false;
+      }
 
       const currentPrice = Number(stock.currentPrice);
       if (!Number.isFinite(currentPrice)) return false;
@@ -435,11 +477,20 @@ function preFilterCandidates(stocks, portfolio) {
       if (usableCash < bufferedPrice) return false;
       if (maxTradeCash < bufferedPrice) return false;
 
-      if (!canBuy(stock.id)) return false;
+      // 공격 배당 모드에서는 같은 종목 쿨다운도 완화
+      if (!aggressiveDividendMode && !canBuy(stock.id)) return false;
 
       return true;
     })
     .sort((a, b) => {
+      const aHolding = holdings.has(a.id) ? 1 : 0;
+      const bHolding = holdings.has(b.id) ? 1 : 0;
+
+      // 공격 배당 모드에서는 이미 보유 중인 종목을 우선 추가매수
+      if (aggressiveDividendMode && bHolding !== aHolding) {
+        return bHolding - aHolding;
+      }
+
       const aJustLive = isLiveJustStarted(a.id) ? 1 : 0;
       const bJustLive = isLiveJustStarted(b.id) ? 1 : 0;
 
@@ -595,7 +646,13 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           return null;
         }
 
-        const quantity = getAdaptiveBuyQuantity(stock, dividendMode);
+        const aggressiveDividendMode = isDividendAggressiveMode();
+        const alreadyHolding = makeHoldingMap(portfolio).has(stock.id);
+
+        const quantity =
+           aggressiveDividendMode && alreadyHolding
+            ? algo.dividendAddBuyQuantity
+            : getAdaptiveBuyQuantity(stock, dividendMode);
 
         return {
           type: 'BUY',
@@ -613,6 +670,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           quantity,
           price: stock.currentPrice,
           score,
+          allowAddToHolding: aggressiveDividendMode && alreadyHolding,
           momentum1h,
           momentumShort,
           momentumMicro,

@@ -100,9 +100,13 @@ async function executeBuySignal(signal) {
 
   const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
 
-  if (alreadyHolding) {
+  if (alreadyHolding && !signal.allowAddToHolding) {
     console.log(`[BUY SKIP] 이미 보유 중: ${signal.stockName}`);
     return;
+  }
+
+  if (alreadyHolding && signal.allowAddToHolding) {
+    console.log(`[DIVIDEND ADD BUY] 이미 보유 중이지만 배당 모드 추가매수 허용: ${signal.stockName}`);
   }
 
   const freshStock = await getStockDetail(signal.stockId);
