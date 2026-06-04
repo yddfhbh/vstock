@@ -27,6 +27,11 @@ function nowText() {
   });
 }
 
+function numberEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 async function getScannedStocks() {
   const all = [];
   const batchSize = 5;
@@ -71,7 +76,9 @@ function printStatus(portfolio, stocks) {
   const liveCount = stocks.filter(stock => stock.isLive).length;
 
   console.log(
-    `\n[${nowText()}] 감시 ${stocks.length}개 / LIVE ${liveCount}개 / 잔고 ${portfolio.me.balance.toLocaleString()}원 / 총자산 ${portfolio.me.totalAsset.toLocaleString()}원`
+    `\n[${nowText()}] 감시 ${stocks.length}개 / LIVE ${liveCount}개 / ` +
+    `잔고 ${portfolio.me.balance.toLocaleString()}원 / ` +
+    `총자산 ${portfolio.me.totalAsset.toLocaleString()}원`
   );
 
   if (!portfolio.holdings || portfolio.holdings.length === 0) {
@@ -81,32 +88,41 @@ function printStatus(portfolio, stocks) {
 
   for (const holding of portfolio.holdings) {
     console.log(
-      `  보유: ${holding.stockName} ${holding.quantity}주 / 평단 ${holding.averagePrice.toLocaleString()} / 현재 ${holding.currentPrice.toLocaleString()} / 수익률 ${holding.profitRate}%`
+      `  보유: ${holding.stockName} ${holding.quantity}주 / ` +
+      `평단 ${holding.averagePrice.toLocaleString()} / ` +
+      `현재 ${holding.currentPrice.toLocaleString()} / ` +
+      `수익률 ${holding.profitRate}%`
     );
   }
 }
 
 async function executeBuySignal(signal) {
   const freshPortfolio = await getPortfolio();
-
   const holdings = freshPortfolio.holdings || [];
 
-  if (holdings.length >= config.maxPositions) {
+  const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
+
+  // 이미 보유 중인 종목 추가매수는 maxPositions 체크에서 제외
+  if (!alreadyHolding && holdings.length >= config.maxPositions) {
     console.log(
-      `[BUY SKIP] 최대 보유 종목 수 도달: ${holdings.length}/${config.maxPositions}`
+      `[BUY SKIP] 최대 보유 종목 수 도달: ` +
+      `${holdings.length}/${config.maxPositions}`
     );
     return;
   }
 
-  const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
-
+  // 일반 모드에서는 같은 종목 추가매수 금지
+  // 배당 공격 모드에서 allowAddToHolding=true일 때만 추가매수 허용
   if (alreadyHolding && !signal.allowAddToHolding) {
     console.log(`[BUY SKIP] 이미 보유 중: ${signal.stockName}`);
     return;
   }
 
   if (alreadyHolding && signal.allowAddToHolding) {
-    console.log(`[DIVIDEND ADD BUY] 이미 보유 중이지만 배당 모드 추가매수 허용: ${signal.stockName}`);
+    console.log(
+      `[DIVIDEND ADD BUY] 이미 보유 중이지만 배당 모드 추가매수 허용: ` +
+      `${signal.stockName}`
+    );
   }
 
   const freshStock = await getStockDetail(signal.stockId);
@@ -119,22 +135,36 @@ async function executeBuySignal(signal) {
     return;
   }
 
-  const usableCash = Math.max(0, balance - config.buyCashReserve);
+  // 배당 추가매수 신호면 배당용 현금/거래한도 사용
+  const cashReserve = signal.allowAddToHolding
+    ? numberEnv('DIVIDEND_CASH_RESERVE', config.buyCashReserve)
+    : config.buyCashReserve;
+
+  const buyCashRate = signal.allowAddToHolding
+    ? numberEnv('DIVIDEND_MAX_BUY_CASH_PER_TRADE_RATE', config.maxBuyCashPerTradeRate)
+    : config.maxBuyCashPerTradeRate;
+
+  const usableCash = Math.max(0, balance - cashReserve);
 
   if (usableCash <= 0) {
     console.log(
-      `[BUY SKIP] 사용 가능 현금 없음: 잔고 ${balance.toLocaleString()}원 / 예비현금 ${config.buyCashReserve.toLocaleString()}원`
+      `[BUY SKIP] 사용 가능 현금 없음: ` +
+      `잔고 ${balance.toLocaleString()}원 / ` +
+      `예비현금 ${cashReserve.toLocaleString()}원`
     );
     return;
   }
 
   const maxTradeCash = Math.floor(
-    usableCash * (config.maxBuyCashPerTradeRate / 100)
+    usableCash * (buyCashRate / 100)
   );
 
   if (maxTradeCash < config.minBuyCash) {
     console.log(
-      `[BUY SKIP] 매수 가능 현금이 너무 적음: 사용가능 ${usableCash.toLocaleString()}원 / 거래한도 ${maxTradeCash.toLocaleString()}원 / 최소 ${config.minBuyCash.toLocaleString()}원`
+      `[BUY SKIP] 매수 가능 현금이 너무 적음: ` +
+      `사용가능 ${usableCash.toLocaleString()}원 / ` +
+      `거래한도 ${maxTradeCash.toLocaleString()}원 / ` +
+      `최소 ${config.minBuyCash.toLocaleString()}원`
     );
     return;
   }
@@ -168,7 +198,8 @@ async function executeBuySignal(signal) {
     `[BUY FINAL] ${signal.stockName} ${finalQuantity}주 / ` +
     `현재가 ${currentPrice.toLocaleString()}원 / ` +
     `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
-    `거래한도 ${maxTradeCash.toLocaleString()}원`
+    `거래한도 ${maxTradeCash.toLocaleString()}원` +
+    `${signal.allowAddToHolding ? ' / 배당 추가매수' : ''}`
   );
 
   await buyStock(signal.stockId, finalQuantity);
@@ -193,7 +224,8 @@ async function executeSellSignal(signal) {
   }
 
   console.log(
-    `[SELL FINAL] ${signal.stockName} ${finalQuantity}주 / 현재 수익률 ${holding.profitRate}%`
+    `[SELL FINAL] ${signal.stockName} ${finalQuantity}주 / ` +
+    `현재 수익률 ${holding.profitRate}%`
   );
 
   await sellStock(signal.stockId, finalQuantity);
@@ -202,7 +234,8 @@ async function executeSellSignal(signal) {
 
 async function executeSignal(signal) {
   console.log(
-    `[SIGNAL] ${signal.type} ${signal.stockName} ${signal.quantity}주 / 이유: ${signal.reason}`
+    `[SIGNAL] ${signal.type} ${signal.stockName} ${signal.quantity}주 / ` +
+    `이유: ${signal.reason}`
   );
 
   if (signal.type === 'BUY') {
@@ -238,6 +271,7 @@ async function mainLoop() {
       await sleep(500);
     }
 
+    // 매도 후 포트폴리오 갱신해서 매수 판단
     const latestPortfolio = await getPortfolio();
 
     const buySignals = await getBuySignals(stocks, latestPortfolio, getStockPrices);
