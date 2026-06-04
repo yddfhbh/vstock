@@ -10,6 +10,9 @@ const buyConfirmMap = new Map();
 const lastLiveState = new Map();
 const liveStartedAt = new Map();
 let liveStateSeeded = false;
+let lastAnyBuyAt = 0;
+let consecutiveLossSells = 0;
+let buyPausedUntil = 0;
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -47,12 +50,49 @@ const algo = {
   dividendBuyQuantity: numberEnv('DIVIDEND_BUY_QUANTITY', 2),
   dividendStopLossRate: numberEnv('DIVIDEND_STOP_LOSS_RATE', -5),
   dividendMinScore: numberEnv('DIVIDEND_MIN_SCORE', 10),
+
+  buyGlobalCooldownMs: numberEnv('BUY_GLOBAL_COOLDOWN_MS', 45000),
+  lossPauseCount: numberEnv('LOSS_PAUSE_COUNT', 2),
+  lossPauseMs: numberEnv('LOSS_PAUSE_MS', 180000),
 };
 
 function nowKstMinutes() {
   const now = new Date();
   const kst = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
   return kst.getHours() * 60 + kst.getMinutes();
+}
+
+function boolEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  return String(raw).trim().toLowerCase() === 'true';
+}
+
+function hasHoldingLoss(portfolio) {
+  return (portfolio.holdings || []).some(h => Number(h.profitRate || 0) < -0.3);
+}
+
+function canOpenNewPosition(portfolio) {
+  const now = Date.now();
+
+  if (now < buyPausedUntil) {
+    console.log(`[BUY PAUSE] 손절 연속 발생으로 매수 중단 중: ${Math.ceil((buyPausedUntil - now) / 1000)}초 남음`);
+    return false;
+  }
+
+  if (now - lastAnyBuyAt < algo.buyGlobalCooldownMs) {
+    return false;
+  }
+
+  if (
+    boolEnv('BLOCK_BUY_WHEN_HOLDING_LOSS', true) &&
+    hasHoldingLoss(portfolio)
+  ) {
+    console.log('[BUY BLOCK] 보유 종목 중 손실 종목이 있어 신규매수 보류');
+    return false;
+  }
+
+  return true;
 }
 
 function isDividendMode() {
@@ -608,11 +648,26 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 
 function markSignalTraded(signal) {
   if (signal.type === 'BUY') {
+    lastAnyBuyAt = Date.now();
     markBought(signal.stockId);
     return;
   }
 
   if (signal.type === 'SELL') {
+    const reason = String(signal.reason || '');
+
+    if (reason.includes('손절')) {
+      consecutiveLossSells += 1;
+
+      if (consecutiveLossSells >= algo.lossPauseCount) {
+        buyPausedUntil = Date.now() + algo.lossPauseMs;
+        console.log(`[BUY PAUSE] 손절 ${consecutiveLossSells}회 연속 → ${Math.round(algo.lossPauseMs / 1000)}초 매수 중단`);
+        consecutiveLossSells = 0;
+      }
+    } else if (reason.includes('익절')) {
+      consecutiveLossSells = 0;
+    }
+
     markSold(signal.stockId);
   }
 }
