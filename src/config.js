@@ -35,6 +35,11 @@ const config = {
   takeProfitRate: numberEnv('TAKE_PROFIT_RATE', 5),
   stopLossRate: numberEnv('STOP_LOSS_RATE', -5),
   tradeCooldownMs: numberEnv('TRADE_COOLDOWN_MS', 30000),
+
+  maxHoldMs: numberEnv('MAX_HOLD_MS', 420000),
+  timeExitProfitRate: numberEnv('TIME_EXIT_PROFIT_RATE', 0.5),
+  timeExitLossRate: numberEnv('TIME_EXIT_LOSS_RATE', -1.2),
+  minShortMomentum: numberEnv('MIN_SHORT_MOMENTUM', 1.2),
 };
 
 module.exports = config;

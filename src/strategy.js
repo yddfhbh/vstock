@@ -2,6 +2,7 @@ const config = require('./config');
 
 const lastTradeAt = new Map();
 const holdingPeaks = new Map();
+const holdingFirstSeenAt = new Map();
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
@@ -9,17 +10,17 @@ function numberEnv(name, fallback) {
 }
 
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 20),
+  evaluateTopN: numberEnv('EVALUATE_TOP_N', 25),
   maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
-  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 8),
+  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 15),
 
-  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 2),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 35),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 45),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -18),
+  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 4),
+  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 22),
+  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 24),
+  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -3),
 
-  trailingStartRate: numberEnv('TRAILING_START_RATE', 3),
-  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -2),
+  trailingStartRate: numberEnv('TRAILING_START_RATE', 1.2),
+  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.8),
 };
 
 function canTrade(stockId) {
@@ -60,6 +61,7 @@ function analyzePricePoints(points, fallbackPrice) {
   const high = Math.max(...valid, last);
   const low = Math.min(...valid, last);
 
+  // 최근 4포인트 기준 단기 모멘텀
   const shortBase = valid[Math.max(0, valid.length - 4)];
 
   const momentum1h = percentChange(first, last);
@@ -81,15 +83,24 @@ function analyzePricePoints(points, fallbackPrice) {
 
 function getSellSignals(portfolio) {
   const signals = [];
+  const currentHoldingIds = new Set();
 
   for (const holding of portfolio.holdings || []) {
     const stockId = holding.stockId;
+    currentHoldingIds.add(stockId);
+
     const currentPrice = Number(holding.currentPrice);
     const prevPeak = holdingPeaks.get(stockId) || currentPrice;
     const newPeak = Math.max(prevPeak, currentPrice);
 
     holdingPeaks.set(stockId, newPeak);
 
+    if (!holdingFirstSeenAt.has(stockId)) {
+      holdingFirstSeenAt.set(stockId, Date.now());
+    }
+
+    const firstSeenAt = holdingFirstSeenAt.get(stockId);
+    const holdingMs = Date.now() - firstSeenAt;
     const peakDrawdown = percentChange(newPeak, currentPrice);
 
     if (!canTrade(stockId)) continue;
@@ -97,7 +108,7 @@ function getSellSignals(portfolio) {
     if (holding.profitRate >= config.takeProfitRate) {
       signals.push({
         type: 'SELL',
-        reason: `익절 조건 도달: ${holding.profitRate}%`,
+        reason: `단타 익절: ${holding.profitRate}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -108,7 +119,7 @@ function getSellSignals(portfolio) {
     if (holding.profitRate <= config.stopLossRate) {
       signals.push({
         type: 'SELL',
-        reason: `손절 조건 도달: ${holding.profitRate}%`,
+        reason: `단타 손절: ${holding.profitRate}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -122,11 +133,48 @@ function getSellSignals(portfolio) {
     ) {
       signals.push({
         type: 'SELL',
-        reason: `트레일링 매도: 고점 대비 ${peakDrawdown.toFixed(2)}%`,
+        reason: `단타 트레일링: 고점 대비 ${peakDrawdown.toFixed(2)}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
       });
+      continue;
+    }
+
+    if (
+      holdingMs >= config.maxHoldMs &&
+      holding.profitRate >= config.timeExitProfitRate
+    ) {
+      signals.push({
+        type: 'SELL',
+        reason: `시간 청산 익절: ${Math.round(holdingMs / 1000)}초 보유 / ${holding.profitRate}%`,
+        stockId,
+        stockName: holding.stockName,
+        quantity: holding.quantity,
+      });
+      continue;
+    }
+
+    if (
+      holdingMs >= config.maxHoldMs &&
+      holding.profitRate <= config.timeExitLossRate
+    ) {
+      signals.push({
+        type: 'SELL',
+        reason: `시간 청산 손절: ${Math.round(holdingMs / 1000)}초 보유 / ${holding.profitRate}%`,
+        stockId,
+        stockName: holding.stockName,
+        quantity: holding.quantity,
+      });
+      continue;
+    }
+  }
+
+  // 이미 판 종목은 추적 데이터 삭제
+  for (const stockId of holdingFirstSeenAt.keys()) {
+    if (!currentHoldingIds.has(stockId)) {
+      holdingFirstSeenAt.delete(stockId);
+      holdingPeaks.delete(stockId);
     }
   }
 
@@ -141,21 +189,39 @@ function preFilterCandidates(stocks, portfolio) {
     return [];
   }
 
-  const usableCash = Math.max(0, Number(portfolio.me.balance || 0) - config.buyCashReserve);
+  const usableCash = Math.max(
+    0,
+    Number(portfolio.me.balance || 0) - config.buyCashReserve
+  );
+
+  const maxTradeCash = Math.floor(
+    usableCash * (config.maxBuyCashPerTradeRate / 100)
+  );
+
+  if (usableCash <= 0) return [];
+  if (maxTradeCash < config.minBuyCash) return [];
 
   return stocks
     .filter(stock => {
       if (holdings.has(stock.id)) return false;
       if (stock.isDelisted) return false;
-      if (!Number.isFinite(Number(stock.currentPrice))) return false;
-      if (stock.currentPrice <= 0) return false;
+
+      const currentPrice = Number(stock.currentPrice);
+      if (!Number.isFinite(currentPrice)) return false;
+      if (currentPrice <= 0) return false;
+
+      // 너무 이미 오른 종목 제외
       if (stock.changeRate > config.maxChangeRateOnEntry) return false;
 
       const bufferedPrice = Math.ceil(
-        stock.currentPrice * (1 + config.buyPriceBufferRate / 100)
+        currentPrice * (1 + config.buyPriceBufferRate / 100)
       );
 
+      // 전체 잔고로도 못 사면 제외
       if (usableCash < bufferedPrice) return false;
+
+      // 1회 거래 한도로도 못 사면 제외
+      if (maxTradeCash < bufferedPrice) return false;
 
       if (!canTrade(stock.id)) return false;
 
@@ -187,8 +253,12 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         momentum1h >= algo.minMomentum1h &&
         momentum1h <= algo.maxMomentum1h;
 
-      const shortMomentumOk = momentumShort >= 0.5;
+      // 단타형: 최근 단기 상승이 약하면 제외
+      const shortMomentumOk = momentumShort >= config.minShortMomentum;
+
       const volatilityOk = volatility1h <= algo.maxVolatility1h;
+
+      // 고점에서 많이 밀린 종목 제외
       const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
       if (!momentumOk || !shortMomentumOk || !volatilityOk || !pullbackOk) {
@@ -197,24 +267,25 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 
       let score = 0;
 
-      score += momentum1h * 1.5;
-      score += momentumShort * 1.0;
-      score += stock.changeRate * 0.03;
+      // 단타형: 1시간 전체보다 최근 단기 모멘텀 비중을 높임
+      score += momentum1h * 1.0;
+      score += momentumShort * 2.0;
+      score += stock.changeRate * 0.02;
 
       if (stock.isLive) {
-        score += 1;
+        score += 0.5;
       }
 
-      if (volatility1h > 20) {
-        score -= (volatility1h - 20) * 0.2;
+      if (volatility1h > 18) {
+        score -= (volatility1h - 18) * 0.35;
       }
 
-      if (pullbackFromHigh < -8) {
-        score -= Math.abs(pullbackFromHigh + 8) * 0.3;
+      if (pullbackFromHigh < -2) {
+        score -= Math.abs(pullbackFromHigh + 2) * 0.8;
       }
 
-      if (stock.changeRate > 80) {
-        score -= (stock.changeRate - 80) * 0.08;
+      if (stock.changeRate > 60) {
+        score -= (stock.changeRate - 60) * 0.12;
       }
 
       if (score < algo.buyScoreThreshold) {
@@ -224,7 +295,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
       signals.push({
         type: 'BUY',
         reason:
-          `모멘텀 점수 ${score.toFixed(2)} / ` +
+          `단타 점수 ${score.toFixed(2)} / ` +
           `1h ${momentum1h.toFixed(2)}% / ` +
           `short ${momentumShort.toFixed(2)}% / ` +
           `vol ${volatility1h.toFixed(2)}% / ` +
