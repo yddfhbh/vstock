@@ -47,7 +47,9 @@ async function getScannedStocks() {
     );
 
     for (const data of results) {
-      all.push(...data.items);
+      if (data?.items) {
+        all.push(...data.items);
+      }
     }
 
     const last = results[results.length - 1];
@@ -84,93 +86,128 @@ function printStatus(portfolio, stocks) {
   }
 }
 
+async function executeBuySignal(signal) {
+  const freshPortfolio = await getPortfolio();
+
+  const holdings = freshPortfolio.holdings || [];
+
+  if (holdings.length >= config.maxPositions) {
+    console.log(
+      `[BUY SKIP] 최대 보유 종목 수 도달: ${holdings.length}/${config.maxPositions}`
+    );
+    return;
+  }
+
+  const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
+
+  if (alreadyHolding) {
+    console.log(`[BUY SKIP] 이미 보유 중: ${signal.stockName}`);
+    return;
+  }
+
+  const freshStock = await getStockDetail(signal.stockId);
+
+  const balance = Number(freshPortfolio.me.balance || 0);
+  const currentPrice = Number(freshStock.currentPrice || signal.price || 0);
+
+  if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+    console.log(`[BUY SKIP] 현재가 이상함: ${signal.stockName} / ${currentPrice}`);
+    return;
+  }
+
+  const usableCash = Math.max(0, balance - config.buyCashReserve);
+
+  if (usableCash <= 0) {
+    console.log(
+      `[BUY SKIP] 사용 가능 현금 없음: 잔고 ${balance.toLocaleString()}원 / 예비현금 ${config.buyCashReserve.toLocaleString()}원`
+    );
+    return;
+  }
+
+  const maxTradeCash = Math.floor(
+    usableCash * (config.maxBuyCashPerTradeRate / 100)
+  );
+
+  if (maxTradeCash < config.minBuyCash) {
+    console.log(
+      `[BUY SKIP] 매수 가능 현금이 너무 적음: 사용가능 ${usableCash.toLocaleString()}원 / 거래한도 ${maxTradeCash.toLocaleString()}원 / 최소 ${config.minBuyCash.toLocaleString()}원`
+    );
+    return;
+  }
+
+  const bufferedPrice = Math.ceil(
+    currentPrice * (1 + config.buyPriceBufferRate / 100)
+  );
+
+  const affordableQuantityByBalance = Math.floor(usableCash / bufferedPrice);
+  const affordableQuantityByLimit = Math.floor(maxTradeCash / bufferedPrice);
+
+  const finalQuantity = Math.min(
+    signal.quantity,
+    affordableQuantityByBalance,
+    affordableQuantityByLimit
+  );
+
+  if (finalQuantity <= 0) {
+    console.log(
+      `[BUY SKIP] 거래한도 또는 잔액 부족: ` +
+      `잔고 ${balance.toLocaleString()}원 / ` +
+      `현재가 ${currentPrice.toLocaleString()}원 / ` +
+      `버퍼가 ${bufferedPrice.toLocaleString()}원 / ` +
+      `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
+      `거래한도 ${maxTradeCash.toLocaleString()}원`
+    );
+    return;
+  }
+
+  console.log(
+    `[BUY FINAL] ${signal.stockName} ${finalQuantity}주 / ` +
+    `현재가 ${currentPrice.toLocaleString()}원 / ` +
+    `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
+    `거래한도 ${maxTradeCash.toLocaleString()}원`
+  );
+
+  await buyStock(signal.stockId, finalQuantity);
+  markSignalTraded(signal);
+}
+
+async function executeSellSignal(signal) {
+  const freshPortfolio = await getPortfolio();
+  const holding = (freshPortfolio.holdings || [])
+    .find(h => h.stockId === signal.stockId);
+
+  if (!holding) {
+    console.log(`[SELL SKIP] 보유 중 아님: ${signal.stockName}`);
+    return;
+  }
+
+  const finalQuantity = Math.min(signal.quantity, holding.quantity);
+
+  if (finalQuantity <= 0) {
+    console.log(`[SELL SKIP] 매도 가능 수량 없음: ${signal.stockName}`);
+    return;
+  }
+
+  console.log(
+    `[SELL FINAL] ${signal.stockName} ${finalQuantity}주 / 현재 수익률 ${holding.profitRate}%`
+  );
+
+  await sellStock(signal.stockId, finalQuantity);
+  markSignalTraded(signal);
+}
+
 async function executeSignal(signal) {
   console.log(
     `[SIGNAL] ${signal.type} ${signal.stockName} ${signal.quantity}주 / 이유: ${signal.reason}`
   );
 
   if (signal.type === 'BUY') {
-    const freshPortfolio = await getPortfolio();
-
-    if ((freshPortfolio.holdings || []).length >= config.maxPositions) {
-      console.log(
-        `[BUY SKIP] 최대 보유 종목 수 도달: ` +
-        `${freshPortfolio.holdings.length}/${config.maxPositions}`
-      );
-      return;
-    }
-
-    const alreadyHolding = (freshPortfolio.holdings || [])
-      .some(h => h.stockId === signal.stockId);
-
-    if (alreadyHolding) {
-      console.log(`[BUY SKIP] 이미 보유 중: ${signal.stockName}`);
-      return;
-    }
-
-    const freshStock = await getStockDetail(signal.stockId);
-
-    const balance = Number(freshPortfolio.me.balance || 0);
-    const currentPrice = Number(freshStock.currentPrice || signal.price || 0);
-
-    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-      console.log(`[BUY SKIP] 현재가 이상함: ${signal.stockName} / ${currentPrice}`);
-      return;
-    }
-
-    const usableCash = Math.max(0, balance - config.buyCashReserve);
-
-    const maxTradeCash = Math.floor(
-      usableCash * (config.maxBuyCashPerTradeRate / 100)
-    );
-
-    if (maxTradeCash < config.minBuyCash) {
-      console.log(
-        `[BUY SKIP] 매수 가능 현금이 너무 적음: ` +
-        `사용가능 ${usableCash.toLocaleString()}원 / ` +
-        `거래한도 ${maxTradeCash.toLocaleString()}원`
-      );
-      return;
-    }
-
-    const bufferedPrice = Math.ceil(
-      currentPrice * (1 + config.buyPriceBufferRate / 100)
-    );
-
-    const affordableQuantityByBalance = Math.floor(usableCash / bufferedPrice);
-    const affordableQuantityByLimit = Math.floor(maxTradeCash / bufferedPrice);
-
-    const finalQuantity = Math.min(
-      signal.quantity,
-      affordableQuantityByBalance,
-      affordableQuantityByLimit
-    );
-
-    if (finalQuantity <= 0) {
-      console.log(
-        `[BUY SKIP] 잔액 부족: 잔고 ${balance.toLocaleString()}원 / ` +
-        `예상가 ${currentPrice.toLocaleString()}원 / ` +
-        `버퍼가 ${bufferedPrice.toLocaleString()}원 / ` +
-        `예비현금 ${config.buyCashReserve.toLocaleString()}원`
-      );
-      return;
-    }
-
-    console.log(
-      `[BUY FINAL] ${signal.stockName} ${finalQuantity}주 / ` +
-      `현재가 ${currentPrice.toLocaleString()}원 / ` +
-      `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
-      `거래한도 ${maxTradeCash.toLocaleString()}원`
-    );
-
-    await buyStock(signal.stockId, finalQuantity);
-    markSignalTraded(signal);
+    await executeBuySignal(signal);
     return;
   }
 
   if (signal.type === 'SELL') {
-    await sellStock(signal.stockId, signal.quantity);
-    markSignalTraded(signal);
+    await executeSellSignal(signal);
     return;
   }
 
@@ -197,7 +234,9 @@ async function mainLoop() {
       await sleep(500);
     }
 
-    const buySignals = await getBuySignals(stocks, portfolio, getStockPrices);
+    const latestPortfolio = await getPortfolio();
+
+    const buySignals = await getBuySignals(stocks, latestPortfolio, getStockPrices);
     for (const signal of buySignals) {
       await executeSignal(signal);
       await sleep(500);
