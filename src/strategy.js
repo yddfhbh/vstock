@@ -536,6 +536,56 @@ function cleanupBuyConfirm() {
   }
 }
 
+function makeDividendForceBuySignals(portfolio) {
+  if (!isDividendAggressiveMode()) {
+    return [];
+  }
+
+  if (!boolEnv('DIVIDEND_FORCE_BUY', true)) {
+    return [];
+  }
+
+  const balance = Number(portfolio.me?.balance || 0);
+  const reserve = algo.dividendCashReserve;
+  const usableCash = Math.max(0, balance - reserve);
+
+  if (usableCash < config.minBuyCash) {
+    return [];
+  }
+
+  const minProfitRate = numberEnv('DIVIDEND_ADD_BUY_MIN_PROFIT_RATE', -5);
+
+  const holdings = [...(portfolio.holdings || [])]
+    .filter(h => Number(h.currentPrice || 0) > 0)
+    .filter(h => Number(h.profitRate || 0) >= minProfitRate)
+    .sort((a, b) => {
+      const ap = Number(a.profitRate || 0);
+      const bp = Number(b.profitRate || 0);
+
+      // 수익률 좋은 종목 우선
+      if (bp !== ap) return bp - ap;
+
+      // 같으면 평가금액 큰 종목 우선
+      return holdingValue(b) - holdingValue(a);
+    })
+    .slice(0, algo.dividendMaxPositions);
+
+  return holdings.map(h => ({
+    type: 'BUY',
+    reason:
+      `배당 강제 추가매수 / ` +
+      `보유 ${h.quantity}주 / ` +
+      `수익률 ${h.profitRate}% / ` +
+      `잔고 ${balance.toLocaleString()}원`,
+    stockId: h.stockId,
+    stockName: h.stockName,
+    quantity: algo.dividendAddBuyQuantity,
+    price: h.currentPrice,
+    score: 999,
+    allowAddToHolding: true,
+  }));
+}
+
 async function mapLimit(items, limit, mapper) {
   const results = new Array(items.length);
   let index = 0;
@@ -556,9 +606,22 @@ async function mapLimit(items, limit, mapper) {
 
 async function getBuySignals(stocks, portfolio, getStockPrices) {
   const dividendMode = isDividendMode();
-  const candidates = preFilterCandidates(stocks, portfolio);
 
   cleanupBuyConfirm();
+
+  const forcedDividendSignals = makeDividendForceBuySignals(portfolio);
+
+  if (forcedDividendSignals.length > 0) {
+    console.log(
+      `[DIVIDEND FORCE] 보유 종목 강제 추가매수 후보 ` +
+      `${forcedDividendSignals.length}개 / ` +
+      `signals=${Math.min(forcedDividendSignals.length, algo.maxBuysPerLoop)}`
+    );
+
+    return forcedDividendSignals.slice(0, algo.maxBuysPerLoop);
+  }
+
+  const candidates = preFilterCandidates(stocks, portfolio);
 
   const analyzed = await mapLimit(
     candidates,
