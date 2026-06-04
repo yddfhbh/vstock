@@ -1,0 +1,17 @@
+{
+  "name": "vstock-bot",
+  "version": "1.0.0",
+  "description": "V-STOCK monitor and dry-run trading bot",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "save-auth": "node src/save-auth-cdp.js",
+    "login": "node src/login.js",
+    "start": "node src/index.js",
+    "debug-capture": "node src/debug-capture.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "playwright": "^1.56.1"
+  }
+}
