@@ -47,6 +47,16 @@ const algo = {
   highChaseMomentum1h: numberEnv('HIGH_CHASE_MOMENTUM_1H', 7),
   highChaseRangePosition: numberEnv('HIGH_CHASE_RANGE_POSITION', 0.96),
   highChaseMaxPullbackFromHigh: numberEnv('HIGH_CHASE_MAX_PULLBACK_FROM_HIGH', -0.25),
+  maxShortMomentum: numberEnv('MAX_SHORT_MOMENTUM', 6),
+  maxMicroMomentum: numberEnv('MAX_MICRO_MOMENTUM', 4),
+  maxRecentMomentum: numberEnv('MAX_RECENT_MOMENTUM', 6),
+  lateSpikeMomentum1h: numberEnv('LATE_SPIKE_MOMENTUM_1H', 10),
+  lateSpikeShortMomentum: numberEnv('LATE_SPIKE_SHORT_MOMENTUM', 5),
+  lateSpikeRangePosition: numberEnv('LATE_SPIKE_RANGE_POSITION', 0.86),
+  breakoutRangePosition: numberEnv('BREAKOUT_RANGE_POSITION', 0.98),
+  breakoutMaxPullbackFromHigh: numberEnv('BREAKOUT_MAX_PULLBACK_FROM_HIGH', -0.2),
+  breakoutMinScore: numberEnv('BREAKOUT_MIN_SCORE', 16),
+  breakoutMinTrendConsistency: numberEnv('BREAKOUT_MIN_TREND_CONSISTENCY', 0.75),
   targetRegularPositions: numberEnv('TARGET_REGULAR_POSITIONS', 6),
   regularPositionCashRate: numberEnv('REGULAR_POSITION_CASH_RATE', 16),
   regularMinPositionCash: numberEnv('REGULAR_MIN_POSITION_CASH', 50000),
@@ -74,6 +84,7 @@ const algo = {
   buyGlobalCooldownMs: numberEnv('BUY_GLOBAL_COOLDOWN_MS', 45000),
   lossPauseCount: numberEnv('LOSS_PAUSE_COUNT', 2),
   lossPauseMs: numberEnv('LOSS_PAUSE_MS', 180000),
+  holdingLossBlockRate: numberEnv('HOLDING_LOSS_BLOCK_RATE', -0.3),
 
   dividendAggressiveStartHour: numberEnv('DIVIDEND_AGGRESSIVE_START_HOUR', 23),
   dividendAggressiveStartMinute: numberEnv('DIVIDEND_AGGRESSIVE_START_MINUTE', 50),
@@ -82,7 +93,10 @@ const algo = {
   dividendAddBuyQuantity: numberEnv('DIVIDEND_ADD_BUY_QUANTITY', 3),
 
   earlyStopMs: numberEnv('EARLY_STOP_MS', 90000),
+  earlyStopMinMs: numberEnv('EARLY_STOP_MIN_MS', 0),
   earlyStopLossRate: numberEnv('EARLY_STOP_LOSS_RATE', -0.8),
+  panicMinHoldMs: numberEnv('PANIC_MIN_HOLD_MS', 30000),
+  panicMinPeakProfitRate: numberEnv('PANIC_MIN_PEAK_PROFIT_RATE', 0),
   panicPeakDrawdownRate: numberEnv('PANIC_PEAK_DRAWDOWN_RATE', -1.8),
   timeExitNeutralRate: numberEnv('TIME_EXIT_NEUTRAL_RATE', -0.15),
 
@@ -107,7 +121,8 @@ function boolEnv(name, fallback = false) {
 }
 
 function hasHoldingLoss(portfolio) {
-  return (portfolio.holdings || []).some(h => Number(h.profitRate || 0) < -0.3);
+  return (portfolio.holdings || [])
+    .some(h => Number(h.profitRate || 0) <= algo.holdingLossBlockRate);
 }
 
 function canOpenNewPosition(portfolio) {
@@ -471,7 +486,11 @@ function getSellSignals(portfolio) {
 
     const firstSeenAt = holdingFirstSeenAt.get(stockId);
     const holdingMs = Date.now() - firstSeenAt;
+    const averagePrice = Number(holding.averagePrice || 0);
     const peakDrawdown = percentChange(newPeak, currentPrice);
+    const peakProfitRate = averagePrice > 0
+      ? percentChange(averagePrice, newPeak)
+      : 0;
 
     // 배당 모드:
     // 상위 3개는 자정 배당을 위해 최대한 유지.
@@ -518,7 +537,7 @@ function getSellSignals(portfolio) {
     if (holding.profitRate >= config.takeProfitRate) {
       signals.push({
         type: 'SELL',
-        reason: `단타 익절: ${holding.profitRate}%`,
+        reason: `스윙 익절: ${holding.profitRate}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -527,12 +546,15 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      holding.profitRate >= algo.trailingStartRate &&
+      peakProfitRate >= algo.trailingStartRate &&
       peakDrawdown <= algo.trailingDropRate
     ) {
       signals.push({
         type: 'SELL',
-        reason: `단타 트레일링: 고점 대비 ${peakDrawdown.toFixed(2)}%`,
+        reason:
+          `스윙 트레일링: ` +
+          `고점수익 ${peakProfitRate.toFixed(2)}% / ` +
+          `고점 대비 ${peakDrawdown.toFixed(2)}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -541,6 +563,7 @@ function getSellSignals(portfolio) {
     }
 
     if (
+      holdingMs >= algo.earlyStopMinMs &&
       holdingMs <= algo.earlyStopMs &&
       holding.profitRate <= algo.earlyStopLossRate
     ) {
@@ -555,12 +578,17 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      holdingMs >= 30000 &&
+      holdingMs >= algo.panicMinHoldMs &&
+      peakProfitRate >= algo.panicMinPeakProfitRate &&
       peakDrawdown <= algo.panicPeakDrawdownRate
     ) {
       signals.push({
         type: 'SELL',
-        reason: `고점 이탈 방어: 고점 대비 ${peakDrawdown.toFixed(2)}%`,
+        reason:
+          `고점 이탈 방어: ` +
+          `고점수익 ${peakProfitRate.toFixed(2)}% / ` +
+          `고점 대비 ${peakDrawdown.toFixed(2)}% / ` +
+          `현재 ${holding.profitRate}%`,
         stockId,
         stockName: holding.stockName,
         quantity: holding.quantity,
@@ -909,6 +937,22 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           momentum1h < algo.highChaseMomentum1h ||
           rangePosition < algo.highChaseRangePosition ||
           pullbackFromHigh < algo.highChaseMaxPullbackFromHigh;
+        const spikeMomentumOk =
+          dividendMode ||
+          justLive ||
+          (
+            momentumShort <= algo.maxShortMomentum &&
+            momentumMicro <= algo.maxMicroMomentum &&
+            momentumRecent <= algo.maxRecentMomentum
+          );
+        const lateSpikeOk =
+          dividendMode ||
+          justLive ||
+          !(
+            momentum1h >= algo.lateSpikeMomentum1h &&
+            momentumShort >= algo.lateSpikeShortMomentum &&
+            rangePosition >= algo.lateSpikeRangePosition
+          );
         const volatilityOk = volatility1h <= algo.maxVolatility1h;
         const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
@@ -921,6 +965,8 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         if (!downStreakOk) failedReasons.push('downStreak');
         if (!rangePositionOk) failedReasons.push('rangeLow');
         if (!highChaseOk) failedReasons.push('highChase');
+        if (!spikeMomentumOk) failedReasons.push('spike');
+        if (!lateSpikeOk) failedReasons.push('lateSpike');
         if (!overheatOk) failedReasons.push('overheat');
         if (!volatilityOk) failedReasons.push('volatility');
         if (!pullbackOk) failedReasons.push('pullback');
@@ -994,6 +1040,21 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 
         if (stock.changeRate > 80) {
           score -= (stock.changeRate - 80) * 0.03;
+        }
+
+        const weakBreakout =
+          !dividendMode &&
+          !justLive &&
+          rangePosition >= algo.breakoutRangePosition &&
+          pullbackFromHigh >= algo.breakoutMaxPullbackFromHigh &&
+          (
+            score < algo.breakoutMinScore ||
+            trendConsistency < algo.breakoutMinTrendConsistency
+          );
+
+        if (weakBreakout) {
+          filterStats.set('weakBreakout', (filterStats.get('weakBreakout') || 0) + 1);
+          return null;
         }
 
         if (score < minScore) {
