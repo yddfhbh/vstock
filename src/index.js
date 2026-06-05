@@ -1,4 +1,5 @@
 let isLoopRunning = false;
+let loopIntervalId = null;
 
 const config = require('./config');
 
@@ -31,6 +32,39 @@ function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
 }
+
+function shutdown(reason, code = 0) {
+  console.log(`[SHUTDOWN] ${reason}`);
+
+  if (loopIntervalId) {
+    clearInterval(loopIntervalId);
+    loopIntervalId = null;
+  }
+
+  process.exit(code);
+}
+
+process.once('SIGINT', () => {
+  shutdown('SIGINT 수신. Ctrl+C 또는 터미널 중단으로 종료됨', 0);
+});
+
+process.once('SIGTERM', () => {
+  shutdown('SIGTERM 수신. 외부 종료 신호로 종료됨', 0);
+});
+
+process.on('uncaughtException', err => {
+  console.error(`[FATAL] uncaughtException: ${err.stack || err.message}`);
+  shutdown('처리되지 않은 예외로 종료됨', 1);
+});
+
+process.on('unhandledRejection', err => {
+  console.error(`[FATAL] unhandledRejection: ${err?.stack || err}`);
+  shutdown('처리되지 않은 Promise 거부로 종료됨', 1);
+});
+
+process.on('beforeExit', code => {
+  console.log(`[SHUTDOWN] 이벤트 루프가 비어서 자연 종료됨 / code=${code}`);
+});
 
 async function getScannedStocks() {
   const all = [];
@@ -299,7 +333,7 @@ async function start() {
 
   await mainLoop();
 
-  setInterval(mainLoop, config.pollMs);
+  loopIntervalId = setInterval(mainLoop, config.pollMs);
 }
 
 start();
