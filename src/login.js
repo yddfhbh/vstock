@@ -38,25 +38,31 @@ async function main() {
 
   await waitEnter('\n로그인이 끝나고 사이트에서 내 프로필/잔고가 보이면 Enter를 눌러줘... ');
 
-  const me = await page.evaluate(async () => {
-    const res = await fetch('/api/me', {
-      credentials: 'include',
-    });
+  const userResponsePromise = page.waitForResponse(
+    response => response.url().includes('/api/users/me'),
+    { timeout: 15000 }
+  ).catch(() => null);
 
-    const text = await res.text();
-
-    try {
-      return {
-        status: res.status,
-        json: JSON.parse(text),
-      };
-    } catch {
-      return {
-        status: res.status,
-        text,
-      };
-    }
+  await page.reload({
+    waitUntil: 'domcontentloaded',
   });
+
+  const userResponse = await userResponsePromise;
+  const text = userResponse ? await userResponse.text() : '';
+
+  let me = {
+    status: userResponse?.status() || 0,
+    text,
+  };
+
+  try {
+    me = {
+      status: me.status,
+      json: JSON.parse(text),
+    };
+  } catch {
+    // Keep text result for diagnostics.
+  }
 
   console.log('로그인 확인 결과:', me);
 
@@ -66,6 +72,7 @@ async function main() {
 
   await context.storageState({
     path: authPath,
+    indexedDB: true,
   });
 
   console.log(`로그인 세션 저장 완료: ${authPath}`);

@@ -201,7 +201,7 @@ async function apiFetch(pathValue, options = {}) {
 }
 
 async function getMe() {
-  return apiFetch('/api/me');
+  return apiFetch('/api/users/me');
 }
 
 async function getPortfolio() {

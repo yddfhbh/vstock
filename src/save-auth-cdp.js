@@ -10,7 +10,7 @@ async function main() {
   fs.mkdirSync(path.dirname(authPath), { recursive: true });
 
   console.log('Chrome 원격 디버깅 포트에 연결 중...');
-  const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+  const browser = await chromium.connectOverCDP(config.chromeCdpUrl);
 
   const context = browser.contexts()[0];
   let page = context.pages().find(p => p.url().includes('virtual-stock.xyz'));
@@ -24,25 +24,31 @@ async function main() {
 
   console.log('현재 페이지:', page.url());
 
-  const result = await page.evaluate(async () => {
-    const res = await fetch('/api/me', {
-      credentials: 'include',
-    });
+  const userResponsePromise = page.waitForResponse(
+    response => response.url().includes('/api/users/me'),
+    { timeout: 15000 }
+  ).catch(() => null);
 
-    const text = await res.text();
-
-    try {
-      return {
-        status: res.status,
-        json: JSON.parse(text),
-      };
-    } catch {
-      return {
-        status: res.status,
-        text,
-      };
-    }
+  await page.reload({
+    waitUntil: 'domcontentloaded',
   });
+
+  const userResponse = await userResponsePromise;
+  const text = userResponse ? await userResponse.text() : '';
+
+  let result = {
+    status: userResponse?.status() || 0,
+    text,
+  };
+
+  try {
+    result = {
+      status: result.status,
+      json: JSON.parse(text),
+    };
+  } catch {
+    // Keep text result for diagnostics.
+  }
 
   console.log('로그인 확인 결과:', result);
 
@@ -54,6 +60,7 @@ async function main() {
 
   await context.storageState({
     path: authPath,
+    indexedDB: true,
   });
 
   console.log(`로그인 세션 저장 완료: ${authPath}`);

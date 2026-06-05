@@ -25,6 +25,7 @@ function boolEnv(name, fallback = false) {
 const config = {
   baseUrl: process.env.VSTOCK_BASE_URL || 'https://virtual-stock.xyz',
   chromeCdpUrl: process.env.CHROME_CDP_URL || 'http://127.0.0.1:9222',
+  authStateFile: process.env.AUTH_STATE_FILE || 'auth/vstock-auth-state.json',
 
   dryRun: boolEnv('DRY_RUN', true),
   enableTrading: boolEnv('ENABLE_TRADING', false),
