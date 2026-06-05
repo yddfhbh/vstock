@@ -44,6 +44,12 @@ const algo = {
   minRangePosition: numberEnv('MIN_RANGE_POSITION', 0.35),
   overheatRangePosition: numberEnv('OVERHEAT_RANGE_POSITION', 0.94),
   overheatMicroMomentum: numberEnv('OVERHEAT_MICRO_MOMENTUM', 1.5),
+  highChaseMomentum1h: numberEnv('HIGH_CHASE_MOMENTUM_1H', 7),
+  highChaseRangePosition: numberEnv('HIGH_CHASE_RANGE_POSITION', 0.96),
+  highChaseMaxPullbackFromHigh: numberEnv('HIGH_CHASE_MAX_PULLBACK_FROM_HIGH', -0.25),
+  targetRegularPositions: numberEnv('TARGET_REGULAR_POSITIONS', 6),
+  regularPositionCashRate: numberEnv('REGULAR_POSITION_CASH_RATE', 16),
+  regularMinPositionCash: numberEnv('REGULAR_MIN_POSITION_CASH', 50000),
   chopPenaltyWeight: numberEnv('CHOP_PENALTY_WEIGHT', 0.35),
   liveStockScoreBonus: numberEnv('LIVE_STOCK_SCORE_BONUS', 0.6),
   stockTypeBlueChipWeight: numberEnv('STOCK_TYPE_BLUE_CHIP_WEIGHT', 0.8),
@@ -188,6 +194,19 @@ function makeHoldingMap(portfolio) {
 
 function holdingValue(holding) {
   return Number(holding.currentPrice || 0) * Number(holding.quantity || 0);
+}
+
+function portfolioAsset(portfolio) {
+  const totalAsset = Number(portfolio.me?.totalAsset || 0);
+  if (Number.isFinite(totalAsset) && totalAsset > 0) {
+    return totalAsset;
+  }
+
+  const balance = Number(portfolio.me?.balance || 0);
+  const holdingsValue = (portfolio.holdings || [])
+    .reduce((sum, holding) => sum + holdingValue(holding), 0);
+
+  return Math.max(0, balance + holdingsValue);
 }
 
 function getDividendInfo(stock) {
@@ -362,6 +381,34 @@ function getAdaptiveBuyQuantity(stock, dividendMode) {
   }
 
   return config.buyQuantity;
+}
+
+function getRegularBuySizing(stock, portfolio) {
+  const price = Number(stock.currentPrice || 0);
+  const totalAsset = portfolioAsset(portfolio);
+  const targetBySlots = Math.floor(
+    totalAsset / Math.max(1, algo.targetRegularPositions)
+  );
+  const targetByRate = Math.floor(
+    totalAsset * (algo.regularPositionCashRate / 100)
+  );
+  const targetCash = Math.max(
+    config.minBuyCash,
+    algo.regularMinPositionCash,
+    Math.min(targetBySlots, targetByRate)
+  );
+
+  if (!Number.isFinite(price) || price <= 0) {
+    return {
+      quantity: config.buyQuantity,
+      targetCash,
+    };
+  }
+
+  return {
+    quantity: Math.max(config.buyQuantity, Math.round(targetCash / price)),
+    targetCash,
+  };
 }
 
 function updateLiveTransitions(stocks) {
@@ -857,6 +904,11 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           justLive ||
           rangePosition < algo.overheatRangePosition ||
           momentumMicro <= algo.overheatMicroMomentum;
+        const highChaseOk =
+          justLive ||
+          momentum1h < algo.highChaseMomentum1h ||
+          rangePosition < algo.highChaseRangePosition ||
+          pullbackFromHigh < algo.highChaseMaxPullbackFromHigh;
         const volatilityOk = volatility1h <= algo.maxVolatility1h;
         const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
@@ -868,6 +920,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         if (!trendOk) failedReasons.push('trend');
         if (!downStreakOk) failedReasons.push('downStreak');
         if (!rangePositionOk) failedReasons.push('rangeLow');
+        if (!highChaseOk) failedReasons.push('highChase');
         if (!overheatOk) failedReasons.push('overheat');
         if (!volatilityOk) failedReasons.push('volatility');
         if (!pullbackOk) failedReasons.push('pullback');
@@ -881,12 +934,28 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         let score = 0;
         const stockTypeWeight = getStockTypeWeight(stock);
 
-        score += Math.min(momentum1h, algo.maxMomentum1h) * 1.0;
-        score += momentumShort * 2.5;
-        score += momentumMicro * 2.0;
-        score += momentumRecent * 2.2;
-        score += (trendConsistency - 0.5) * 8.0;
-        score += Math.max(0, rangePosition - 0.5) * 2.0;
+        if (dividendMode) {
+          score += Math.min(momentum1h, algo.maxMomentum1h) * 1.0;
+          score += momentumShort * 2.5;
+          score += momentumMicro * 2.0;
+          score += momentumRecent * 2.2;
+          score += (trendConsistency - 0.5) * 8.0;
+          score += Math.max(0, rangePosition - 0.5) * 2.0;
+        } else {
+          const balancedRangeBonus = Math.max(
+            0,
+            1 - Math.abs(rangePosition - 0.72) / 0.35
+          );
+
+          score += Math.min(momentum1h, algo.maxMomentum1h) * 1.1;
+          score += momentumShort * 1.2;
+          score += momentumMicro * 0.7;
+          score += momentumRecent * 1.3;
+          score += (trendConsistency - 0.5) * 10.0;
+          score += balancedRangeBonus * 3.0;
+          score -= Math.max(0, rangePosition - 0.94) * 8.0;
+        }
+
         score -= consecutiveDownTicks * 1.3;
         score += stockTypeWeight;
         score += stock.changeRate * 0.001;
@@ -935,15 +1004,23 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         const aggressiveDividendMode = isDividendAggressiveMode();
         const alreadyHolding = makeHoldingMap(portfolio).has(stock.id);
 
-        const quantity =
-           aggressiveDividendMode && alreadyHolding
-            ? algo.dividendAddBuyQuantity
-            : getAdaptiveBuyQuantity(stock, dividendMode);
+        let targetCash = null;
+        let quantity;
+
+        if (aggressiveDividendMode && alreadyHolding) {
+          quantity = algo.dividendAddBuyQuantity;
+        } else if (dividendMode) {
+          quantity = getAdaptiveBuyQuantity(stock, dividendMode);
+        } else {
+          const sizing = getRegularBuySizing(stock, portfolio);
+          quantity = sizing.quantity;
+          targetCash = sizing.targetCash;
+        }
 
         return {
           type: 'BUY',
                     reason:
-            `${dividendMode ? '배당+단타' : '단타'} 점수 ${score.toFixed(2)} / ` +
+            `${dividendMode ? '배당+단타' : '분산 투자'} 점수 ${score.toFixed(2)} / ` +
             `1h ${momentum1h.toFixed(2)}% / ` +
             `short ${momentumShort.toFixed(2)}% / ` +
             `micro ${momentumMicro.toFixed(2)}% / ` +
@@ -953,6 +1030,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
             `trend ${(trendConsistency * 100).toFixed(0)}% / ` +
             `range ${(rangePosition * 100).toFixed(0)}% / ` +
             `type ${stock.stockType || '-'}` +
+            `${targetCash ? ` / 목표 ${targetCash.toLocaleString()}원` : ''}` +
             `${dividendBonusInfo && dividendBonusInfo.bonus > 0
               ? ` / 배당률 ${dividendBonusInfo.rate}% / 배당횟수 ${dividendBonusInfo.count}`
               : ''}` +
@@ -963,6 +1041,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           quantity,
           price: stock.currentPrice,
           score,
+          targetCash,
           allowAddToHolding: aggressiveDividendMode && alreadyHolding,
           momentum1h,
           momentumShort,

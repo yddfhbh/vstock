@@ -210,8 +210,16 @@ async function executeBuySignal(signal) {
   const affordableQuantityByBalance = Math.floor(usableCash / bufferedPrice);
   const affordableQuantityByLimit = Math.floor(maxTradeCash / bufferedPrice);
 
+  const targetCash = Number(signal.targetCash || 0);
+  const targetQuantity = targetCash > 0
+    ? Math.max(
+        Number(signal.quantity || 0),
+        Math.round(targetCash / currentPrice)
+      )
+    : Number(signal.quantity || 0);
+
   const finalQuantity = Math.min(
-    signal.quantity,
+    targetQuantity,
     affordableQuantityByBalance,
     affordableQuantityByLimit
   );
@@ -233,6 +241,7 @@ async function executeBuySignal(signal) {
     `현재가 ${currentPrice.toLocaleString()}원 / ` +
     `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
     `거래한도 ${maxTradeCash.toLocaleString()}원` +
+    `${targetCash > 0 ? ` / 목표금액 ${targetCash.toLocaleString()}원` : ''}` +
     `${signal.allowAddToHolding ? ' / 배당 추가매수' : ''}`
   );
 
