@@ -131,10 +131,56 @@ function printStatus(portfolio, stocks) {
 }
 
 async function executeBuySignal(signal) {
-  const freshPortfolio = await getPortfolio();
-  const holdings = freshPortfolio.holdings || [];
+  let freshPortfolio = await getPortfolio();
+  let holdings = freshPortfolio.holdings || [];
 
-  const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
+  let alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
+
+  if (
+    !alreadyHolding &&
+    holdings.length >= config.maxPositions &&
+    signal.rotateOutStockId
+  ) {
+    const rotateHolding = holdings
+      .find(h => h.stockId === signal.rotateOutStockId);
+
+    if (rotateHolding) {
+      const rotateQuantity = Math.min(
+        Number(signal.rotateOutQuantity || rotateHolding.quantity || 0),
+        Number(rotateHolding.quantity || 0)
+      );
+
+      if (rotateQuantity > 0) {
+        console.log(
+          `[ROTATE SELL] ${rotateHolding.stockName} ${rotateQuantity}주 / ` +
+          `${signal.stockName} 매수 슬롯 확보 / ` +
+          `현재 수익률 ${rotateHolding.profitRate}%`
+        );
+
+        await sellStock(rotateHolding.stockId, rotateQuantity);
+        markSignalTraded({
+          type: 'SELL',
+          reason:
+            `로테이션 매도: ${signal.stockName} 신규매수 / ` +
+            `${rotateHolding.profitRate}%`,
+          stockId: rotateHolding.stockId,
+          stockName: rotateHolding.stockName,
+          quantity: rotateQuantity,
+        });
+
+        await sleep(500);
+
+        freshPortfolio = await getPortfolio();
+        holdings = freshPortfolio.holdings || [];
+        alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
+      }
+    } else {
+      console.log(
+        `[ROTATE SKIP] 교체 대상 보유 중 아님: ` +
+        `${signal.rotateOutStockName || signal.rotateOutStockId}`
+      );
+    }
+  }
 
   // 이미 보유 중인 종목 추가매수는 maxPositions 체크에서 제외
   if (!alreadyHolding && holdings.length >= config.maxPositions) {

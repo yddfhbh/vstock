@@ -60,6 +60,11 @@ const algo = {
   targetRegularPositions: numberEnv('TARGET_REGULAR_POSITIONS', 6),
   regularPositionCashRate: numberEnv('REGULAR_POSITION_CASH_RATE', 16),
   regularMinPositionCash: numberEnv('REGULAR_MIN_POSITION_CASH', 50000),
+  enablePositionRotation: boolEnv('ENABLE_POSITION_ROTATION', false),
+  rotationMinNewScore: numberEnv('ROTATION_MIN_NEW_SCORE', 34),
+  rotationMaxExitProfitRate: numberEnv('ROTATION_MAX_EXIT_PROFIT_RATE', 0.5),
+  rotationForceExitLossRate: numberEnv('ROTATION_FORCE_EXIT_LOSS_RATE', -5),
+  rotationMinHoldMs: numberEnv('ROTATION_MIN_HOLD_MS', 180000),
   chopPenaltyWeight: numberEnv('CHOP_PENALTY_WEIGHT', 0.35),
   liveStockScoreBonus: numberEnv('LIVE_STOCK_SCORE_BONUS', 0.6),
   stockTypeBlueChipWeight: numberEnv('STOCK_TYPE_BLUE_CHIP_WEIGHT', 0.8),
@@ -426,6 +431,78 @@ function getRegularBuySizing(stock, portfolio) {
   };
 }
 
+function getHoldingMs(stockId) {
+  const firstSeenAt = holdingFirstSeenAt.get(stockId);
+  return firstSeenAt ? Date.now() - firstSeenAt : Infinity;
+}
+
+function isRotationExitCandidate(holding, reservedIds = new Set()) {
+  if (!algo.enablePositionRotation) return false;
+  if (!holding || reservedIds.has(holding.stockId)) return false;
+
+  const quantity = Number(holding.quantity || 0);
+  const profitRate = Number(holding.profitRate || 0);
+
+  if (quantity <= 0) return false;
+  if (!Number.isFinite(profitRate)) return false;
+  if (profitRate > algo.rotationMaxExitProfitRate) return false;
+
+  const holdingMs = getHoldingMs(holding.stockId);
+  if (
+    holdingMs < algo.rotationMinHoldMs &&
+    profitRate > algo.rotationForceExitLossRate
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function getRotationCash(portfolio) {
+  if (!algo.enablePositionRotation || isDividendMode()) return 0;
+
+  return (portfolio.holdings || [])
+    .filter(holding => isRotationExitCandidate(holding))
+    .reduce((maxCash, holding) => Math.max(maxCash, holdingValue(holding)), 0);
+}
+
+function selectRotationExitHolding(portfolio, signal, reservedIds = new Set()) {
+  if (!algo.enablePositionRotation) return null;
+  if (isDividendMode() || isDividendAggressiveMode()) return null;
+  if (signal.allowAddToHolding) return null;
+  if (Number(signal.score || 0) < algo.rotationMinNewScore) return null;
+  if ((portfolio.holdings || []).length < config.maxPositions) return null;
+
+  const candidates = (portfolio.holdings || [])
+    .filter(holding => holding.stockId !== signal.stockId)
+    .filter(holding => isRotationExitCandidate(holding, reservedIds))
+    .sort((a, b) => {
+      const profitDiff = Number(a.profitRate || 0) - Number(b.profitRate || 0);
+      if (profitDiff !== 0) return profitDiff;
+
+      return holdingValue(b) - holdingValue(a);
+    });
+
+  return candidates[0] || null;
+}
+
+function addRotationPlan(signal, holding) {
+  if (!holding) return signal;
+
+  const profitRate = Number(holding.profitRate || 0);
+
+  return {
+    ...signal,
+    reason:
+      `${signal.reason} / 로테이션 ${holding.stockName} ` +
+      `${profitRate.toFixed(1)}% 대체`,
+    rotateOutStockId: holding.stockId,
+    rotateOutStockName: holding.stockName,
+    rotateOutQuantity: holding.quantity,
+    rotateOutProfitRate: profitRate,
+  };
+}
+
 function updateLiveTransitions(stocks) {
   const now = Date.now();
 
@@ -668,9 +745,20 @@ function preFilterCandidates(stocks, portfolio) {
     ? algo.dividendMaxPositions
     : config.maxPositions;
 
-  // 일반/배당 준비 모드에서는 최대 종목 수 도달 시 신규매수 중단
+  const rotationEnabled =
+    algo.enablePositionRotation &&
+    !dividendMode &&
+    !aggressiveDividendMode &&
+    (portfolio.holdings || []).some(holding => isRotationExitCandidate(holding));
+
+  // 일반/배당 준비 모드에서는 최대 종목 수 도달 시 신규매수 중단.
+  // 단, 일반 공격 모드 로테이션이 켜져 있고 교체 가능한 약한 보유종목이 있으면 후보 분석은 진행.
   // 공격 배당 모드에서는 이미 보유한 종목 추가매수는 허용
-  if (!aggressiveDividendMode && positionCount >= maxPositions) {
+  if (
+    !aggressiveDividendMode &&
+    positionCount >= maxPositions &&
+    !rotationEnabled
+  ) {
     return [];
   }
 
@@ -687,11 +775,16 @@ function preFilterCandidates(stocks, portfolio) {
     Number(portfolio.me.balance || 0) - cashReserve
   );
 
+  const effectiveUsableCash =
+    positionCount >= maxPositions && rotationEnabled
+      ? usableCash + getRotationCash(portfolio)
+      : usableCash;
+
   const maxTradeCash = Math.floor(
-    usableCash * (buyCashRate / 100)
+    effectiveUsableCash * (buyCashRate / 100)
   );
 
-  if (usableCash <= 0) return [];
+  if (effectiveUsableCash <= 0) return [];
   if (maxTradeCash < config.minBuyCash) return [];
 
   return stocks
@@ -726,7 +819,7 @@ function preFilterCandidates(stocks, portfolio) {
         currentPrice * (1 + config.buyPriceBufferRate / 100)
       );
 
-      if (usableCash < bufferedPrice) return false;
+      if (effectiveUsableCash < bufferedPrice) return false;
       if (maxTradeCash < bufferedPrice) return false;
 
       // 공격 배당 모드에서는 같은 종목 쿨다운도 완화
@@ -1126,9 +1219,10 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
     .slice(0, algo.confirmCandidatesN);
 
   const signals = [];
+  const reservedRotationIds = new Set();
 
   for (let i = 0; i < ranked.length; i++) {
-    const signal = ranked[i];
+    let signal = ranked[i];
 
     const confirmCount = updateBuyConfirm(signal.stockId);
 
@@ -1153,6 +1247,18 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
     }
 
     buyConfirmMap.delete(signal.stockId);
+
+    const rotationHolding = selectRotationExitHolding(
+      portfolio,
+      signal,
+      reservedRotationIds
+    );
+
+    if (rotationHolding) {
+      reservedRotationIds.add(rotationHolding.stockId);
+      signal = addRotationPlan(signal, rotationHolding);
+    }
+
     signals.push(signal);
 
     if (signals.length >= algo.maxBuysPerLoop) {
