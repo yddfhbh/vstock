@@ -43,7 +43,7 @@ const algo = {
   maxConsecutiveDownTicks: numberEnv('MAX_CONSECUTIVE_DOWN_TICKS', 2),
   minRangePosition: numberEnv('MIN_RANGE_POSITION', 0.35),
   overheatRangePosition: numberEnv('OVERHEAT_RANGE_POSITION', 0.94),
-  overheatMicroMomentum: numberEnv('OVERHEAT_MICRO_MOMENTUM', 1.2),
+  overheatMicroMomentum: numberEnv('OVERHEAT_MICRO_MOMENTUM', 1.5),
   chopPenaltyWeight: numberEnv('CHOP_PENALTY_WEIGHT', 0.35),
   liveStockScoreBonus: numberEnv('LIVE_STOCK_SCORE_BONUS', 0.6),
   stockTypeBlueChipWeight: numberEnv('STOCK_TYPE_BLUE_CHIP_WEIGHT', 0.8),
@@ -783,6 +783,7 @@ async function mapLimit(items, limit, mapper) {
 
 async function getBuySignals(stocks, portfolio, getStockPrices) {
   const dividendMode = isDividendMode();
+  const filterStats = new Map();
 
   cleanupBuyConfirm();
 
@@ -859,18 +860,21 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         const volatilityOk = volatility1h <= algo.maxVolatility1h;
         const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
 
-        if (
-          !momentumOk ||
-          !shortMomentumOk ||
-          !microMomentumOk ||
-          !recentMomentumOk ||
-          !trendOk ||
-          !downStreakOk ||
-          !rangePositionOk ||
-          !overheatOk ||
-          !volatilityOk ||
-          !pullbackOk
-        ) {
+        const failedReasons = [];
+        if (!momentumOk) failedReasons.push('momentum1h');
+        if (!shortMomentumOk) failedReasons.push('short');
+        if (!microMomentumOk) failedReasons.push('micro');
+        if (!recentMomentumOk) failedReasons.push('recent');
+        if (!trendOk) failedReasons.push('trend');
+        if (!downStreakOk) failedReasons.push('downStreak');
+        if (!rangePositionOk) failedReasons.push('rangeLow');
+        if (!overheatOk) failedReasons.push('overheat');
+        if (!volatilityOk) failedReasons.push('volatility');
+        if (!pullbackOk) failedReasons.push('pullback');
+
+        if (failedReasons.length > 0) {
+          const key = failedReasons[0];
+          filterStats.set(key, (filterStats.get(key) || 0) + 1);
           return null;
         }
 
@@ -924,6 +928,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         }
 
         if (score < minScore) {
+          filterStats.set('score', (filterStats.get('score') || 0) + 1);
           return null;
         }
 
@@ -1018,6 +1023,16 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
   console.log(
     `[BUY DEBUG] candidates=${candidates.length} / ranked=${ranked.length} / signals=${signals.length} / dividendMode=${dividendMode}`
   );
+
+  if (candidates.length > 0 && ranked.length === 0 && filterStats.size > 0) {
+    const topFilters = [...filterStats.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([key, count]) => `${key}:${count}`)
+      .join(' / ');
+
+    console.log(`[BUY FILTER] ${topFilters}`);
+  }
 
   return signals;
 }
