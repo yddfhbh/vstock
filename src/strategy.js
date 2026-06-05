@@ -43,7 +43,7 @@ const algo = {
   maxConsecutiveDownTicks: numberEnv('MAX_CONSECUTIVE_DOWN_TICKS', 2),
   minRangePosition: numberEnv('MIN_RANGE_POSITION', 0.35),
   overheatRangePosition: numberEnv('OVERHEAT_RANGE_POSITION', 0.94),
-  overheatMicroMomentum: numberEnv('OVERHEAT_MICRO_MOMENTUM', 1.8),
+  overheatMicroMomentum: numberEnv('OVERHEAT_MICRO_MOMENTUM', 1.2),
   chopPenaltyWeight: numberEnv('CHOP_PENALTY_WEIGHT', 0.35),
   liveStockScoreBonus: numberEnv('LIVE_STOCK_SCORE_BONUS', 0.6),
   stockTypeBlueChipWeight: numberEnv('STOCK_TYPE_BLUE_CHIP_WEIGHT', 0.8),
@@ -394,7 +394,10 @@ function getLiveAgeText(stockId) {
   const startedAt = liveStartedAt.get(stockId);
   if (!startedAt) return '';
 
-  const sec = Math.round((Date.now() - startedAt) / 1000);
+  const ageMs = Date.now() - startedAt;
+  if (ageMs > algo.liveTransitionWindowMs) return '';
+
+  const sec = Math.round(ageMs / 1000);
   return ` / live+${sec}s`;
 }
 
