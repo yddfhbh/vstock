@@ -60,6 +60,13 @@ const algo = {
   dividendCashReserve: numberEnv('DIVIDEND_CASH_RESERVE', 30000),
   dividendMaxBuyCashPerTradeRate: numberEnv('DIVIDEND_MAX_BUY_CASH_PER_TRADE_RATE', 60),
   dividendAddBuyQuantity: numberEnv('DIVIDEND_ADD_BUY_QUANTITY', 3),
+
+    dividendRateWeight: numberEnv('DIVIDEND_RATE_WEIGHT', 1.2),
+  dividendCountWeight: numberEnv('DIVIDEND_COUNT_WEIGHT', 1.0),
+  dividendRateWalkDog: numberEnv('DIVIDEND_RATE_WALKDOG', 3),
+  dividendRateNative: numberEnv('DIVIDEND_RATE_NATIVE', 15),
+  dividendRateUnknownTier: numberEnv('DIVIDEND_RATE_UNKNOWN_TIER', 0),
+
 };
 
 function nowKstMinutes() {
@@ -162,6 +169,69 @@ function makeHoldingMap(portfolio) {
 
 function holdingValue(holding) {
   return Number(holding.currentPrice || 0) * Number(holding.quantity || 0);
+}
+
+function getDividendInfo(stock) {
+  const gradeRaw =
+    stock.oshiGrade ??
+    stock.grade ??
+    stock.oshiLevel ??
+    stock.oshiRank ??
+    stock.oshi?.grade ??
+    stock.oshi?.level ??
+    stock.dividendGrade ??
+    '';
+
+  const grade = String(gradeRaw || '');
+
+  let rate = Number(
+    stock.dividendRate ??
+    stock.dividend_rate ??
+    stock.oshiDividendRate ??
+    stock.oshi_dividend_rate ??
+    stock.oshi?.dividendRate ??
+    stock.dividend?.rate
+  );
+
+  let count = Number(
+    stock.dividendCount ??
+    stock.dividend_count ??
+    stock.oshiDividendCount ??
+    stock.oshi_dividend_count ??
+    stock.oshi?.dividendCount ??
+    stock.dividend?.count
+  );
+
+  if (!Number.isFinite(rate)) rate = 0;
+  if (!Number.isFinite(count)) count = 0;
+
+  if (rate <= 0) {
+    if (grade.includes('산책견')) {
+      rate = algo.dividendRateWalkDog;
+      if (count <= 0) count = 1;
+    } else if (grade.includes('원주민')) {
+      rate = algo.dividendRateNative;
+      if (count <= 0) count = 3;
+    } else if (grade.includes('???')) {
+      rate = algo.dividendRateUnknownTier;
+      if (count <= 0) count = 8;
+    }
+  }
+
+  return { grade, rate, count };
+}
+
+function getDividendScoreBonus(stock) {
+  const info = getDividendInfo(stock);
+
+  const bonus =
+    Math.max(0, info.rate) * algo.dividendRateWeight +
+    Math.max(0, info.count) * algo.dividendCountWeight;
+
+  return {
+    ...info,
+    bonus,
+  };
 }
 
 function getDividendTopHoldingIds(portfolio) {
@@ -687,10 +757,13 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           score += algo.liveTransitionBoost;
         }
 
+                let dividendBonusInfo = null;
+
         if (dividendMode) {
-          // 배당 모드에서는 현재가가 어느 정도 있는 종목이 유리함.
-          // 단 너무 비싼 종목은 maxEntryPrice에서 이미 제외.
           score += Math.min(Number(stock.currentPrice || 0) / 20000, 5);
+
+          dividendBonusInfo = getDividendScoreBonus(stock);
+          score += dividendBonusInfo.bonus;
         }
 
         if (volatility1h > 12) {
@@ -719,13 +792,16 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
 
         return {
           type: 'BUY',
-          reason:
+                    reason:
             `${dividendMode ? '배당+단타' : '단타'} 점수 ${score.toFixed(2)} / ` +
             `1h ${momentum1h.toFixed(2)}% / ` +
             `short ${momentumShort.toFixed(2)}% / ` +
             `micro ${momentumMicro.toFixed(2)}% / ` +
             `vol ${volatility1h.toFixed(2)}% / ` +
             `high ${pullbackFromHigh.toFixed(2)}%` +
+            `${dividendBonusInfo && dividendBonusInfo.bonus > 0
+              ? ` / 배당률 ${dividendBonusInfo.rate}% / 배당횟수 ${dividendBonusInfo.count}`
+              : ''}` +
             `${justLive ? ' / LIVE 전환 감지' : ''}` +
             `${getLiveAgeText(stock.id)}`,
           stockId: stock.id,
