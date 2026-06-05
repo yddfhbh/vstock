@@ -1081,7 +1081,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         return {
           type: 'BUY',
                     reason:
-            `${dividendMode ? '배당+단타' : '분산 투자'} 점수 ${score.toFixed(2)} / ` +
+            `${dividendMode ? '배당+단타' : '공격 모멘텀'} 점수 ${score.toFixed(2)} / ` +
             `1h ${momentum1h.toFixed(2)}% / ` +
             `short ${momentumShort.toFixed(2)}% / ` +
             `micro ${momentumMicro.toFixed(2)}% / ` +
