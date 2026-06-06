@@ -33,6 +33,15 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function portfolioExposureRate(portfolio) {
+  const totalAsset = toNumber(portfolio.me?.totalAsset);
+  const balance = Math.max(0, toNumber(portfolio.me?.balance));
+
+  if (totalAsset <= 0) return 0;
+
+  return Math.max(0, ((totalAsset - balance) / totalAsset) * 100);
+}
+
 function shutdown(reason, code = 0) {
   console.log(`[SHUTDOWN] ${reason}`);
 
@@ -164,11 +173,24 @@ async function executeBuySignal(signal) {
     signal.maxTradeCashRate,
     config.maxBuyCashPerTradeRate
   );
+  const maxPortfolioExposureRate = Math.min(
+    100,
+    Math.max(0, toNumber(signal.maxPortfolioExposureRate, 100))
+  );
   const buyPriceBufferRate = toNumber(
     signal.buyPriceBufferRate,
     config.buyPriceBufferRate
   );
   const usableCash = Math.max(0, balance - buyCashReserve);
+  const exposureRate = portfolioExposureRate(freshPortfolio);
+
+  if (exposureRate >= maxPortfolioExposureRate) {
+    console.log(
+      `[BUY SKIP] exposure cap: ${exposureRate.toFixed(1)}% / ` +
+      `max ${maxPortfolioExposureRate.toFixed(1)}%`
+    );
+    return;
+  }
 
   if (usableCash <= 0) {
     console.log(
@@ -195,6 +217,24 @@ async function executeBuySignal(signal) {
   );
   const affordableQuantityByBalance = Math.floor(usableCash / bufferedPrice);
   const affordableQuantityByLimit = Math.floor(maxTradeCash / bufferedPrice);
+  const totalAsset = toNumber(freshPortfolio.me?.totalAsset);
+  const exposureQuantityLimit = totalAsset > 0 && maxPortfolioExposureRate < 100
+    ? Math.floor(
+      Math.max(
+        0,
+        totalAsset * (maxPortfolioExposureRate / 100) -
+          Math.max(0, totalAsset - balance)
+      ) / bufferedPrice
+    )
+    : Number.POSITIVE_INFINITY;
+
+  if (exposureQuantityLimit <= 0) {
+    console.log(
+      `[BUY SKIP] exposure cap leaves no room: ` +
+      `${exposureRate.toFixed(1)}% / max ${maxPortfolioExposureRate.toFixed(1)}%`
+    );
+    return;
+  }
 
   const targetCash = toNumber(signal.targetCash);
   const targetQuantity = targetCash > 0
@@ -204,7 +244,8 @@ async function executeBuySignal(signal) {
   const finalQuantity = Math.min(
     targetQuantity,
     affordableQuantityByBalance,
-    affordableQuantityByLimit
+    affordableQuantityByLimit,
+    exposureQuantityLimit
   );
 
   if (finalQuantity <= 0) {

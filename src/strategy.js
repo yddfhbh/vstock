@@ -63,20 +63,20 @@ const algo = {
   lateTopShortMomentum: numberEnv('LEARN_LATE_TOP_SHORT_MOMENTUM', 5),
   lateTopRecentMomentum: numberEnv('LEARN_LATE_TOP_RECENT_MOMENTUM', 8),
 
-  positionCashRate: numberEnv('LEARN_POSITION_CASH_RATE', 15),
+  positionCashRate: numberEnv('LEARN_POSITION_CASH_RATE', 12),
   minPositionCash: numberEnv('LEARN_MIN_POSITION_CASH', 30000),
   minRiskMultiplier: numberEnv('LEARN_MIN_RISK_MULTIPLIER', 0.45),
   maxRiskMultiplier: numberEnv('LEARN_MAX_RISK_MULTIPLIER', 1.35),
-  maxPortfolioExposureRate: numberEnv('LEARN_MAX_PORTFOLIO_EXPOSURE_RATE', 95),
+  maxPortfolioExposureRate: numberEnv('LEARN_MAX_PORTFOLIO_EXPOSURE_RATE', 88),
   minAutoPositions: numberEnv('LEARN_MIN_AUTO_POSITIONS', 3),
-  maxAutoPositions: numberEnv('LEARN_MAX_AUTO_POSITIONS', 7),
-  minTradeCashRate: numberEnv('LEARN_MIN_TRADE_CASH_RATE', 25),
-  maxTradeCashRate: numberEnv('LEARN_MAX_TRADE_CASH_RATE', 70),
+  maxAutoPositions: numberEnv('LEARN_MAX_AUTO_POSITIONS', 6),
+  minTradeCashRate: numberEnv('LEARN_MIN_TRADE_CASH_RATE', 18),
+  maxTradeCashRate: numberEnv('LEARN_MAX_TRADE_CASH_RATE', 58),
 
   globalCooldownMs: numberEnv('LEARN_BUY_GLOBAL_COOLDOWN_MS', 30000),
-  lossPauseCount: numberEnv('LEARN_LOSS_PAUSE_COUNT', 3),
-  lossPauseMs: numberEnv('LEARN_LOSS_PAUSE_MS', 180000),
-  earlyStopPauseMs: numberEnv('LEARN_EARLY_STOP_PAUSE_MS', 90000),
+  lossPauseCount: numberEnv('LEARN_LOSS_PAUSE_COUNT', 2),
+  lossPauseMs: numberEnv('LEARN_LOSS_PAUSE_MS', 240000),
+  earlyStopPauseMs: numberEnv('LEARN_EARLY_STOP_PAUSE_MS', 180000),
 
   stopLossRate: numberEnv('LEARN_STOP_LOSS_RATE', config.stopLossRate),
   takeProfitRate: numberEnv('LEARN_TAKE_PROFIT_RATE', config.takeProfitRate),
@@ -471,25 +471,41 @@ function adaptiveTradeLimits(portfolio) {
     exits.total > 0
       ? exits.losses / exits.total + exits.earlyStops / Math.max(1, exits.total)
       : 0;
+  const recentDamage =
+    exits.earlyStops >= 2 ||
+    exits.losses >= 3 ||
+    lossPressure >= 0.65;
+  const strongRecent =
+    stats.count >= 8 &&
+    stats.avgProfitRate > 1.2 &&
+    stats.winRate >= 0.6 &&
+    exits.earlyStops <= 1 &&
+    exits.losses <= exits.wins;
 
-  let maxPositions = Math.round(3 + risk * 4);
-  if (stats.count >= 6 && stats.avgProfitRate > 1 && stats.winRate >= 0.55) {
+  let maxPositions = Math.round(3 + risk * 3);
+  if (strongRecent) {
     maxPositions += 1;
   }
-  if (lossPressure >= 0.65) maxPositions -= 1;
+  if (recentDamage) maxPositions -= 1;
+  if (exits.earlyStops >= 3) maxPositions -= 1;
 
-  let maxTradeCashRate = 18 + risk * 55;
+  let maxTradeCashRate = 14 + risk * 42;
+  if (strongRecent) maxTradeCashRate += 8;
   if (stats.count >= 6 && stats.avgProfitRate < 0) maxTradeCashRate -= 8;
-  if (exits.earlyStops >= 3) maxTradeCashRate -= 10;
+  if (exits.earlyStops >= 2) maxTradeCashRate -= 8;
+  if (exits.earlyStops >= 3) maxTradeCashRate -= 8;
+  if (lossPressure >= 0.85) maxTradeCashRate -= 6;
 
-  let maxChangeRateOnEntry = 55 + risk * 35;
-  if (exits.earlyStops >= 3) maxChangeRateOnEntry -= 12;
+  let maxChangeRateOnEntry = 45 + risk * 30;
+  if (recentDamage) maxChangeRateOnEntry -= 8;
+  if (exits.earlyStops >= 2) maxChangeRateOnEntry -= 12;
 
-  const buyPriceBufferRate = clamp(2.5 + risk * 2.5, 3, 6);
+  const buyPriceBufferRate = clamp(2 + risk * 2.2, 2.5, 5);
   const tradeCooldownMs =
     algo.globalCooldownMs +
-    (exits.earlyStops >= 3 ? 60000 : 0) +
-    (cleanNumber(memory.stats?.lossStreak) > 0 ? 45000 : 0);
+    (exits.earlyStops >= 3 ? 120000 : exits.earlyStops >= 2 ? 60000 : 0) +
+    (exits.losses >= 4 ? 90000 : exits.losses >= 3 ? 45000 : 0) +
+    (cleanNumber(memory.stats?.lossStreak) > 0 ? 60000 : 0);
 
   return {
     maxPositions: clamp(maxPositions, algo.minAutoPositions, algo.maxAutoPositions),
@@ -498,13 +514,15 @@ function adaptiveTradeLimits(portfolio) {
       algo.minTradeCashRate,
       algo.maxTradeCashRate
     ),
-    maxChangeRateOnEntry: clamp(maxChangeRateOnEntry, 35, 95),
+    maxChangeRateOnEntry: clamp(maxChangeRateOnEntry, 28, 85),
     buyCashReserve: config.buyCashReserve,
     buyPriceBufferRate,
+    maxPortfolioExposureRate: algo.maxPortfolioExposureRate,
     minBuyCash: config.minBuyCash,
     tradeCooldownMs,
     risk,
     lossPressure,
+    recentDamage,
   };
 }
 
@@ -517,33 +535,57 @@ function adaptiveExitRules() {
       ? exits.losses / exits.total + exits.earlyStops / Math.max(1, exits.total)
       : 0;
 
-  let stopLossRate = -5.8 - risk * 2.0;
-  if (lossPressure >= 0.55) stopLossRate += 1.0;
+  let stopLossRate = -5.4 - risk * 1.8;
+  if (lossPressure >= 0.55) stopLossRate += 1.2;
+  if (exits.earlyStops >= 2) stopLossRate += 0.4;
 
   let takeProfitRate = 5.8 + risk * 2.8;
   if (stats.count >= 6 && stats.avgProfitRate < 0) takeProfitRate -= 0.7;
+  if (lossPressure >= 0.55) takeProfitRate -= 0.5;
 
   let trailingStartRate = 2.6 + risk * 1.5;
   let trailingDropRate = -0.95 - risk * 0.8;
-  if (exits.earlyStops >= 3) {
+  if (exits.earlyStops >= 2) {
     trailingStartRate -= 0.3;
     trailingDropRate += 0.25;
   }
 
-  let earlyStopLossRate = -4.4 - risk * 1.7;
-  if (lossPressure >= 0.55) earlyStopLossRate += 0.7;
+  let earlyStopLossRate = -3.9 - risk * 1.5;
+  if (lossPressure >= 0.55) earlyStopLossRate += 0.8;
+  if (exits.earlyStops >= 2) earlyStopLossRate += 0.4;
 
   return {
-    stopLossRate: clamp(stopLossRate, -8.8, -4.2),
-    takeProfitRate: clamp(takeProfitRate, 5.2, 9.5),
-    trailingStartRate: clamp(trailingStartRate, 2.4, 4.8),
+    stopLossRate: clamp(stopLossRate, -8.2, -4.0),
+    takeProfitRate: clamp(takeProfitRate, 5.0, 9.5),
+    trailingStartRate: clamp(trailingStartRate, 2.2, 4.8),
     trailingDropRate: clamp(trailingDropRate, -1.9, -0.7),
     earlyStopMinMs: algo.earlyStopMinMs,
     earlyStopMs: algo.earlyStopMs,
-    earlyStopLossRate: clamp(earlyStopLossRate, -6.8, -3.8),
+    earlyStopLossRate: clamp(earlyStopLossRate, -6.2, -3.4),
     timeExitNeutralRate: algo.timeExitNeutralRate,
     maxHoldMs: Math.round(algo.maxHoldMs * clamp(0.75 + risk * 0.5, 0.75, 1.35)),
   };
+}
+
+function portfolioPressure(portfolio) {
+  const holdings = Array.isArray(portfolio?.holdings) ? portfolio.holdings : [];
+
+  return holdings.reduce(
+    (pressure, holding) => {
+      const profitRate = cleanNumber(
+        holding.profitRate ?? holding.profit ?? holding.changeRate
+      );
+
+      if (profitRate < 0) pressure.losing += 1;
+      if (profitRate <= -3) pressure.weak += 1;
+      return pressure;
+    },
+    {
+      total: holdings.length,
+      losing: 0,
+      weak: 0,
+    }
+  );
 }
 
 function canOpenNewPosition(portfolio) {
@@ -555,8 +597,23 @@ function canOpenNewPosition(portfolio) {
   }
 
   const limits = adaptiveTradeLimits(portfolio);
+  const pressure = portfolioPressure(portfolio);
 
   if (now - lastAnyBuyAt < limits.tradeCooldownMs) {
+    return false;
+  }
+
+  if (
+    limits.recentDamage &&
+    pressure.total >= 3 &&
+    pressure.losing >= Math.max(2, Math.ceil(pressure.total * 0.6))
+  ) {
+    console.log(`[LEARN BUY BLOCK] weak holdings ${pressure.losing}/${pressure.total}`);
+    return false;
+  }
+
+  if (pressure.weak >= 3) {
+    console.log(`[LEARN BUY BLOCK] deep weak holdings ${pressure.weak}/${pressure.total}`);
     return false;
   }
 
@@ -803,6 +860,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           maxTradeCashRate: limits.maxTradeCashRate,
           buyCashReserve: limits.buyCashReserve,
           buyPriceBufferRate: limits.buyPriceBufferRate,
+          maxPortfolioExposureRate: limits.maxPortfolioExposureRate,
           minBuyCash: limits.minBuyCash,
           score: finalScore,
           modelScore,
@@ -1123,22 +1181,32 @@ function markSignalTraded(signal) {
   if (signal.type === 'SELL') {
     learnFromClosedTrade(signal);
 
+    const recentExits = recentExitCounts(8);
+
     if (
       signal.exitKind === 'earlyStop' &&
       cleanNumber(signal.executedProfitRate ?? signal.profitRate) < 0
     ) {
+      const pauseMs =
+        algo.earlyStopPauseMs +
+        Math.min(3, Math.max(0, recentExits.earlyStops - 1)) * 45000 +
+        (recentExits.losses >= 3 ? 60000 : 0);
+
       buyPausedUntil = Math.max(
         buyPausedUntil,
-        Date.now() + algo.earlyStopPauseMs
+        Date.now() + pauseMs
       );
-      console.log(`[LEARN BUY PAUSE] early stop loss, pausing ${Math.round(algo.earlyStopPauseMs / 1000)}s`);
+      console.log(`[LEARN BUY PAUSE] early stop loss, pausing ${Math.round(pauseMs / 1000)}s`);
     }
 
     if (memory.stats.lossStreak >= algo.lossPauseCount) {
-      buyPausedUntil = Date.now() + algo.lossPauseMs;
-      memory.stats.lossStreak = 0;
-      saveMemory();
-      console.log(`[LEARN BUY PAUSE] repeated losses, pausing ${Math.round(algo.lossPauseMs / 1000)}s`);
+      const pauseMs =
+        algo.lossPauseMs +
+        (recentExits.earlyStops >= 2 ? 60000 : 0) +
+        (recentExits.losses >= 4 ? 60000 : 0);
+
+      buyPausedUntil = Math.max(buyPausedUntil, Date.now() + pauseMs);
+      console.log(`[LEARN BUY PAUSE] repeated losses, pausing ${Math.round(pauseMs / 1000)}s`);
     }
 
     markSold(signal.stockId);
