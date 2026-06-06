@@ -135,15 +135,16 @@ async function executeBuySignal(signal) {
   const freshPortfolio = await getPortfolio();
   const holdings = freshPortfolio.holdings || [];
   const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
+  const maxPositions = toNumber(signal.maxPositions, config.maxPositions);
 
   if (alreadyHolding) {
     console.log(`[BUY SKIP] already holding ${signal.stockName}`);
     return;
   }
 
-  if (holdings.length >= config.maxPositions) {
+  if (holdings.length >= maxPositions) {
     console.log(
-      `[BUY SKIP] max positions reached: ${holdings.length}/${config.maxPositions}`
+      `[BUY SKIP] max positions reached: ${holdings.length}/${maxPositions}`
     );
     return;
   }
@@ -157,30 +158,40 @@ async function executeBuySignal(signal) {
     return;
   }
 
-  const usableCash = Math.max(0, balance - config.buyCashReserve);
+  const buyCashReserve = toNumber(signal.buyCashReserve, config.buyCashReserve);
+  const minBuyCash = toNumber(signal.minBuyCash, config.minBuyCash);
+  const maxTradeCashRate = toNumber(
+    signal.maxTradeCashRate,
+    config.maxBuyCashPerTradeRate
+  );
+  const buyPriceBufferRate = toNumber(
+    signal.buyPriceBufferRate,
+    config.buyPriceBufferRate
+  );
+  const usableCash = Math.max(0, balance - buyCashReserve);
 
   if (usableCash <= 0) {
     console.log(
       `[BUY SKIP] no usable cash: balance ${balance.toLocaleString()} / ` +
-      `reserve ${config.buyCashReserve.toLocaleString()}`
+      `reserve ${buyCashReserve.toLocaleString()}`
     );
     return;
   }
 
   const maxTradeCash = Math.floor(
-    usableCash * (config.maxBuyCashPerTradeRate / 100)
+    usableCash * (maxTradeCashRate / 100)
   );
 
-  if (maxTradeCash < config.minBuyCash) {
+  if (maxTradeCash < minBuyCash) {
     console.log(
       `[BUY SKIP] trade cash too small: usable ${usableCash.toLocaleString()} / ` +
-      `limit ${maxTradeCash.toLocaleString()} / min ${config.minBuyCash.toLocaleString()}`
+      `limit ${maxTradeCash.toLocaleString()} / min ${minBuyCash.toLocaleString()}`
     );
     return;
   }
 
   const bufferedPrice = Math.ceil(
-    currentPrice * (1 + config.buyPriceBufferRate / 100)
+    currentPrice * (1 + buyPriceBufferRate / 100)
   );
   const affordableQuantityByBalance = Math.floor(usableCash / bufferedPrice);
   const affordableQuantityByLimit = Math.floor(maxTradeCash / bufferedPrice);
@@ -208,7 +219,7 @@ async function executeBuySignal(signal) {
   console.log(
     `[BUY FINAL] ${signal.stockName} ${finalQuantity} shares / ` +
     `price ${currentPrice.toLocaleString()} / usable ${usableCash.toLocaleString()} / ` +
-    `limit ${maxTradeCash.toLocaleString()}` +
+    `limit ${maxTradeCash.toLocaleString()} / cashRate ${maxTradeCashRate.toFixed(0)}%` +
     `${targetCash > 0 ? ` / target ${targetCash.toLocaleString()}` : ''}`
   );
 
@@ -314,8 +325,7 @@ async function start() {
   console.log(`POLL_MS=${config.pollMs}`);
   console.log(`SCAN_PAGES=${config.scanPages}`);
   console.log(`PAGE_SIZE=${config.pageSize}`);
-  console.log(`MAX_POSITIONS=${config.maxPositions}`);
-  console.log(`MAX_BUY_CASH_PER_TRADE_RATE=${config.maxBuyCashPerTradeRate}`);
+  console.log('STRATEGY_LIMITS=auto');
   console.log(`MIN_BUY_CASH=${config.minBuyCash}`);
   console.log(`DIVIDEND_SYSTEM_AVAILABLE=${config.dividendSystemAvailable}`);
 

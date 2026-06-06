@@ -58,17 +58,25 @@ const algo = {
   maxVolatility1h: numberEnv('LEARN_MAX_VOLATILITY_1H', 42),
   maxPullbackFromHigh: numberEnv('LEARN_MAX_PULLBACK_FROM_HIGH', -18),
   highChaseRangePosition: numberEnv('LEARN_HIGH_CHASE_RANGE_POSITION', 0.985),
-  highChaseMicroMomentum: numberEnv('LEARN_HIGH_CHASE_MICRO_MOMENTUM', 4.5),
+  highChaseMicroMomentum: numberEnv('LEARN_HIGH_CHASE_MICRO_MOMENTUM', 2.2),
+  lateTopMomentum1h: numberEnv('LEARN_LATE_TOP_MOMENTUM_1H', 12),
+  lateTopShortMomentum: numberEnv('LEARN_LATE_TOP_SHORT_MOMENTUM', 5),
+  lateTopRecentMomentum: numberEnv('LEARN_LATE_TOP_RECENT_MOMENTUM', 8),
 
-  positionCashRate: numberEnv('LEARN_POSITION_CASH_RATE', 18),
+  positionCashRate: numberEnv('LEARN_POSITION_CASH_RATE', 15),
   minPositionCash: numberEnv('LEARN_MIN_POSITION_CASH', 30000),
   minRiskMultiplier: numberEnv('LEARN_MIN_RISK_MULTIPLIER', 0.45),
   maxRiskMultiplier: numberEnv('LEARN_MAX_RISK_MULTIPLIER', 1.35),
   maxPortfolioExposureRate: numberEnv('LEARN_MAX_PORTFOLIO_EXPOSURE_RATE', 95),
+  minAutoPositions: numberEnv('LEARN_MIN_AUTO_POSITIONS', 3),
+  maxAutoPositions: numberEnv('LEARN_MAX_AUTO_POSITIONS', 7),
+  minTradeCashRate: numberEnv('LEARN_MIN_TRADE_CASH_RATE', 25),
+  maxTradeCashRate: numberEnv('LEARN_MAX_TRADE_CASH_RATE', 70),
 
-  globalCooldownMs: numberEnv('LEARN_BUY_GLOBAL_COOLDOWN_MS', 15000),
+  globalCooldownMs: numberEnv('LEARN_BUY_GLOBAL_COOLDOWN_MS', 30000),
   lossPauseCount: numberEnv('LEARN_LOSS_PAUSE_COUNT', 3),
   lossPauseMs: numberEnv('LEARN_LOSS_PAUSE_MS', 180000),
+  earlyStopPauseMs: numberEnv('LEARN_EARLY_STOP_PAUSE_MS', 90000),
 
   stopLossRate: numberEnv('LEARN_STOP_LOSS_RATE', config.stopLossRate),
   takeProfitRate: numberEnv('LEARN_TAKE_PROFIT_RATE', config.takeProfitRate),
@@ -78,6 +86,7 @@ const algo = {
   earlyStopMs: numberEnv('LEARN_EARLY_STOP_MS', 900000),
   earlyStopLossRate: numberEnv('LEARN_EARLY_STOP_LOSS_RATE', -5.5),
   timeExitNeutralRate: numberEnv('LEARN_TIME_EXIT_NEUTRAL_RATE', 0.15),
+  maxHoldMs: numberEnv('LEARN_MAX_HOLD_MS', 3600000),
 };
 
 const lastBuyAt = new Map();
@@ -201,12 +210,12 @@ function portfolioExposureRate(portfolio) {
   return (holdingsValue / asset) * 100;
 }
 
-function canBuy(stockId) {
+function canBuy(stockId, cooldownMs) {
   const now = Date.now();
   const lastBuy = lastBuyAt.get(stockId) || 0;
   const lastExit = lastExitAt.get(stockId) || 0;
 
-  return now - Math.max(lastBuy, lastExit) >= config.tradeCooldownMs;
+  return now - Math.max(lastBuy, lastExit) >= cooldownMs;
 }
 
 function markBought(stockId) {
@@ -404,6 +413,7 @@ function recentStats(limit = 30) {
 
 function currentScoreThreshold() {
   const stats = recentStats(20);
+  const exits = recentExitCounts(12);
   let threshold = cleanNumber(memory.scoreThreshold, algo.baseScoreThreshold);
 
   if (stats.count >= 5) {
@@ -411,6 +421,9 @@ function currentScoreThreshold() {
     if (stats.winRate < 0.42) threshold += 0.2;
     if (stats.avgProfitRate > 0.8 && stats.winRate > 0.5) threshold -= 0.15;
   }
+
+  if (exits.earlyStops >= 3) threshold += 0.25;
+  if (exits.total >= 6 && exits.losses / exits.total >= 0.5) threshold += 0.15;
 
   return clamp(threshold, algo.minScoreThreshold, algo.maxScoreThreshold);
 }
@@ -426,6 +439,113 @@ function currentRiskMultiplier() {
   return clamp(multiplier, algo.minRiskMultiplier, algo.maxRiskMultiplier);
 }
 
+function recentExitCounts(limit = 12) {
+  const recent = (memory.closedTrades || []).slice(-limit);
+
+  return recent.reduce(
+    (counts, trade) => {
+      const profitRate = cleanNumber(trade.profitRate);
+      if (profitRate > 0) counts.wins += 1;
+      if (profitRate <= 0) counts.losses += 1;
+      if (trade.exitKind === 'earlyStop') counts.earlyStops += 1;
+      if (trade.exitKind === 'takeProfit') counts.takeProfits += 1;
+      if (trade.exitKind === 'trailing') counts.trailing += 1;
+      return counts;
+    },
+    {
+      wins: 0,
+      losses: 0,
+      earlyStops: 0,
+      takeProfits: 0,
+      trailing: 0,
+      total: recent.length,
+    }
+  );
+}
+
+function adaptiveTradeLimits(portfolio) {
+  const stats = recentStats(16);
+  const exits = recentExitCounts(12);
+  const risk = currentRiskMultiplier();
+  const lossPressure =
+    exits.total > 0
+      ? exits.losses / exits.total + exits.earlyStops / Math.max(1, exits.total)
+      : 0;
+
+  let maxPositions = Math.round(3 + risk * 4);
+  if (stats.count >= 6 && stats.avgProfitRate > 1 && stats.winRate >= 0.55) {
+    maxPositions += 1;
+  }
+  if (lossPressure >= 0.65) maxPositions -= 1;
+
+  let maxTradeCashRate = 18 + risk * 55;
+  if (stats.count >= 6 && stats.avgProfitRate < 0) maxTradeCashRate -= 8;
+  if (exits.earlyStops >= 3) maxTradeCashRate -= 10;
+
+  let maxChangeRateOnEntry = 55 + risk * 35;
+  if (exits.earlyStops >= 3) maxChangeRateOnEntry -= 12;
+
+  const buyPriceBufferRate = clamp(2.5 + risk * 2.5, 3, 6);
+  const tradeCooldownMs =
+    algo.globalCooldownMs +
+    (exits.earlyStops >= 3 ? 60000 : 0) +
+    (cleanNumber(memory.stats?.lossStreak) > 0 ? 45000 : 0);
+
+  return {
+    maxPositions: clamp(maxPositions, algo.minAutoPositions, algo.maxAutoPositions),
+    maxTradeCashRate: clamp(
+      maxTradeCashRate,
+      algo.minTradeCashRate,
+      algo.maxTradeCashRate
+    ),
+    maxChangeRateOnEntry: clamp(maxChangeRateOnEntry, 35, 95),
+    buyCashReserve: config.buyCashReserve,
+    buyPriceBufferRate,
+    minBuyCash: config.minBuyCash,
+    tradeCooldownMs,
+    risk,
+    lossPressure,
+  };
+}
+
+function adaptiveExitRules() {
+  const stats = recentStats(16);
+  const exits = recentExitCounts(12);
+  const risk = currentRiskMultiplier();
+  const lossPressure =
+    exits.total > 0
+      ? exits.losses / exits.total + exits.earlyStops / Math.max(1, exits.total)
+      : 0;
+
+  let stopLossRate = -5.8 - risk * 2.0;
+  if (lossPressure >= 0.55) stopLossRate += 1.0;
+
+  let takeProfitRate = 5.8 + risk * 2.8;
+  if (stats.count >= 6 && stats.avgProfitRate < 0) takeProfitRate -= 0.7;
+
+  let trailingStartRate = 2.6 + risk * 1.5;
+  let trailingDropRate = -0.95 - risk * 0.8;
+  if (exits.earlyStops >= 3) {
+    trailingStartRate -= 0.3;
+    trailingDropRate += 0.25;
+  }
+
+  let earlyStopLossRate = -4.4 - risk * 1.7;
+  if (lossPressure >= 0.55) earlyStopLossRate += 0.7;
+
+  return {
+    stopLossRate: clamp(stopLossRate, -8.8, -4.2),
+    takeProfitRate: clamp(takeProfitRate, 5.2, 9.5),
+    trailingStartRate: clamp(trailingStartRate, 2.4, 4.8),
+    trailingDropRate: clamp(trailingDropRate, -1.9, -0.7),
+    earlyStopMinMs: algo.earlyStopMinMs,
+    earlyStopMs: algo.earlyStopMs,
+    earlyStopLossRate: clamp(earlyStopLossRate, -6.8, -3.8),
+    timeExitNeutralRate: algo.timeExitNeutralRate,
+    maxHoldMs: Math.round(algo.maxHoldMs * clamp(0.75 + risk * 0.5, 0.75, 1.35)),
+  };
+}
+
 function canOpenNewPosition(portfolio) {
   const now = Date.now();
 
@@ -434,7 +554,9 @@ function canOpenNewPosition(portfolio) {
     return false;
   }
 
-  if (now - lastAnyBuyAt < algo.globalCooldownMs) {
+  const limits = adaptiveTradeLimits(portfolio);
+
+  if (now - lastAnyBuyAt < limits.tradeCooldownMs) {
     return false;
   }
 
@@ -453,25 +575,26 @@ function preFilterCandidates(stocks, portfolio) {
 
   const holdings = makeHoldingMap(portfolio);
   const positionCount = portfolio.holdings?.length || 0;
+  const limits = adaptiveTradeLimits(portfolio);
 
-  if (positionCount >= config.maxPositions) return [];
+  if (positionCount >= limits.maxPositions) return [];
 
   const usableCash = Math.max(
     0,
-    cleanNumber(portfolio.me?.balance) - config.buyCashReserve
+    cleanNumber(portfolio.me?.balance) - limits.buyCashReserve
   );
   const maxTradeCash = Math.floor(
-    usableCash * (config.maxBuyCashPerTradeRate / 100)
+    usableCash * (limits.maxTradeCashRate / 100)
   );
 
   if (usableCash <= 0) return [];
-  if (maxTradeCash < config.minBuyCash) return [];
+  if (maxTradeCash < limits.minBuyCash) return [];
 
   return stocks
     .filter(stock => {
       if (stock.isDelisted) return false;
       if (holdings.has(stock.id)) return false;
-      if (!canBuy(stock.id)) return false;
+      if (!canBuy(stock.id, limits.tradeCooldownMs)) return false;
 
       const currentPrice = cleanNumber(stock.currentPrice);
       if (currentPrice <= 0) return false;
@@ -479,11 +602,11 @@ function preFilterCandidates(stocks, portfolio) {
       if (currentPrice > maxTradeCash) return false;
 
       const changeRate = cleanNumber(stock.changeRate);
-      if (changeRate > config.maxChangeRateOnEntry) return false;
+      if (changeRate > limits.maxChangeRateOnEntry) return false;
       if (changeRate < algo.minChangeRateOnEntry) return false;
 
       const bufferedPrice = Math.ceil(
-        currentPrice * (1 + config.buyPriceBufferRate / 100)
+        currentPrice * (1 + limits.buyPriceBufferRate / 100)
       );
 
       return usableCash >= bufferedPrice && maxTradeCash >= bufferedPrice;
@@ -503,6 +626,16 @@ function preFilterCandidates(stocks, portfolio) {
 }
 
 function hardRejectReason(stock, analysis) {
+  const risk = currentRiskMultiplier();
+  const highChaseRangePosition =
+    risk <= 0.6
+      ? Math.min(algo.highChaseRangePosition, 0.94)
+      : algo.highChaseRangePosition;
+  const highChaseMicroMomentum =
+    risk <= 0.6
+      ? Math.min(algo.highChaseMicroMomentum, 1.8)
+      : algo.highChaseMicroMomentum;
+
   if (analysis.volatility1h > algo.maxVolatility1h) return 'volatility';
   if (analysis.momentum1h < algo.minMomentum1h && analysis.trendConsistency < 0.38) {
     return 'falling';
@@ -512,8 +645,18 @@ function hardRejectReason(stock, analysis) {
   }
   if (analysis.pullbackFromHigh < algo.maxPullbackFromHigh) return 'deepPullback';
   if (
-    analysis.rangePosition >= algo.highChaseRangePosition &&
-    analysis.momentumMicro >= algo.highChaseMicroMomentum
+    risk <= 0.7 &&
+    analysis.rangePosition >= 0.96 &&
+    analysis.pullbackFromHigh > -0.35 &&
+    analysis.momentum1h >= algo.lateTopMomentum1h &&
+    analysis.momentumShort >= algo.lateTopShortMomentum &&
+    analysis.momentumRecent >= algo.lateTopRecentMomentum
+  ) {
+    return 'lateTop';
+  }
+  if (
+    analysis.rangePosition >= highChaseRangePosition &&
+    analysis.momentumMicro >= highChaseMicroMomentum
   ) {
     return 'highChase';
   }
@@ -521,26 +664,26 @@ function hardRejectReason(stock, analysis) {
   return '';
 }
 
-function learnedBuySizing(stock, portfolio, score, threshold) {
+function learnedBuySizing(stock, portfolio, score, threshold, limits) {
   const currentPrice = cleanNumber(stock.currentPrice);
   const asset = portfolioAsset(portfolio);
   const riskMultiplier = currentRiskMultiplier();
   const qualityMultiplier = clamp(0.75 + (score - threshold) / 3, 0.55, 1.45);
   const targetCash = Math.max(
-    config.minBuyCash,
+    limits.minBuyCash,
     algo.minPositionCash,
     Math.floor(asset * (algo.positionCashRate / 100) * riskMultiplier * qualityMultiplier)
   );
 
   if (currentPrice <= 0) {
     return {
-      quantity: config.buyQuantity,
+      quantity: 1,
       targetCash,
     };
   }
 
   return {
-    quantity: Math.max(config.buyQuantity, Math.round(targetCash / currentPrice)),
+    quantity: Math.max(1, Math.round(targetCash / currentPrice)),
     targetCash,
   };
 }
@@ -592,6 +735,7 @@ async function mapLimit(items, limit, mapper) {
 async function getBuySignals(stocks, portfolio, getStockPrices) {
   const filterStats = new Map();
   const threshold = currentScoreThreshold();
+  const limits = adaptiveTradeLimits(portfolio);
 
   cleanupBuyConfirm();
 
@@ -628,7 +772,7 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           return null;
         }
 
-        const sizing = learnedBuySizing(stock, portfolio, finalScore, threshold);
+        const sizing = learnedBuySizing(stock, portfolio, finalScore, threshold, limits);
         const stockName = stock.channelName || stock.stockName || stock.name || stock.id;
         const dividendNote = hasDividendSystemInfo(stock)
           ? ' / dividendSystem=present'
@@ -646,7 +790,8 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
             `high ${analysis.pullbackFromHigh.toFixed(2)}% / ` +
             `trend ${(analysis.trendConsistency * 100).toFixed(0)}% / ` +
             `range ${(analysis.rangePosition * 100).toFixed(0)}% / ` +
-            `risk ${currentRiskMultiplier().toFixed(2)}` +
+            `risk ${limits.risk.toFixed(2)} / ` +
+            `slots ${limits.maxPositions} / cashRate ${limits.maxTradeCashRate.toFixed(0)}%` +
             `${explorationScore > 0 ? ` / explore +${explorationScore.toFixed(2)}` : ''}` +
             `${dividendNote}`,
           stockId: stock.id,
@@ -654,6 +799,11 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
           quantity: sizing.quantity,
           price: stock.currentPrice,
           targetCash: sizing.targetCash,
+          maxPositions: limits.maxPositions,
+          maxTradeCashRate: limits.maxTradeCashRate,
+          buyCashReserve: limits.buyCashReserve,
+          buyPriceBufferRate: limits.buyPriceBufferRate,
+          minBuyCash: limits.minBuyCash,
           score: finalScore,
           modelScore,
           explorationScore,
@@ -699,7 +849,8 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
   console.log(
     `[LEARN BUY DEBUG] candidates=${candidates.length} / ` +
     `ranked=${ranked.length} / signals=${signals.length} / ` +
-    `threshold=${threshold.toFixed(2)} / risk=${currentRiskMultiplier().toFixed(2)}`
+    `threshold=${threshold.toFixed(2)} / risk=${limits.risk.toFixed(2)} / ` +
+    `slots=${limits.maxPositions} / cashRate=${limits.maxTradeCashRate.toFixed(0)}%`
   );
 
   if (candidates.length > 0 && ranked.length === 0 && filterStats.size > 0) {
@@ -730,6 +881,7 @@ function makeSellSignal(holding, reason, extra = {}) {
 function getSellSignals(portfolio) {
   const signals = [];
   const currentHoldingIds = new Set();
+  const exits = adaptiveExitRules();
 
   for (const holding of portfolio.holdings || []) {
     const stockId = holding.stockId;
@@ -754,7 +906,7 @@ function getSellSignals(portfolio) {
       ? percentChange(averagePrice, newPeak)
       : Math.max(0, profitRate);
 
-    const stopLoss = algo.stopLossRate * clamp(1 / currentRiskMultiplier(), 0.8, 1.5);
+    const stopLoss = exits.stopLossRate;
 
     if (profitRate <= stopLoss) {
       signals.push(makeSellSignal(
@@ -766,8 +918,8 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      peakProfitRate >= algo.trailingStartRate &&
-      peakDrawdown <= algo.trailingDropRate
+      peakProfitRate >= exits.trailingStartRate &&
+      peakDrawdown <= exits.trailingDropRate
     ) {
       signals.push(makeSellSignal(
         holding,
@@ -777,7 +929,7 @@ function getSellSignals(portfolio) {
       continue;
     }
 
-    if (profitRate >= algo.takeProfitRate) {
+    if (profitRate >= exits.takeProfitRate) {
       signals.push(makeSellSignal(
         holding,
         `adaptive take profit: ${profitRate}%`,
@@ -787,9 +939,9 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      holdingMs >= algo.earlyStopMinMs &&
-      holdingMs <= algo.earlyStopMs &&
-      profitRate <= algo.earlyStopLossRate
+      holdingMs >= exits.earlyStopMinMs &&
+      holdingMs <= exits.earlyStopMs &&
+      profitRate <= exits.earlyStopLossRate
     ) {
       signals.push(makeSellSignal(
         holding,
@@ -800,8 +952,8 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      holdingMs >= config.maxHoldMs &&
-      profitRate >= config.timeExitProfitRate
+      holdingMs >= exits.maxHoldMs &&
+      profitRate >= exits.timeExitNeutralRate
     ) {
       signals.push(makeSellSignal(
         holding,
@@ -812,8 +964,8 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      holdingMs >= config.maxHoldMs &&
-      profitRate <= config.timeExitLossRate
+      holdingMs >= exits.maxHoldMs &&
+      profitRate <= exits.stopLossRate
     ) {
       signals.push(makeSellSignal(
         holding,
@@ -824,8 +976,8 @@ function getSellSignals(portfolio) {
     }
 
     if (
-      holdingMs >= config.maxHoldMs * 2 &&
-      profitRate >= algo.timeExitNeutralRate
+      holdingMs >= exits.maxHoldMs * 2 &&
+      profitRate >= exits.timeExitNeutralRate
     ) {
       signals.push(makeSellSignal(
         holding,
@@ -970,6 +1122,17 @@ function markSignalTraded(signal) {
 
   if (signal.type === 'SELL') {
     learnFromClosedTrade(signal);
+
+    if (
+      signal.exitKind === 'earlyStop' &&
+      cleanNumber(signal.executedProfitRate ?? signal.profitRate) < 0
+    ) {
+      buyPausedUntil = Math.max(
+        buyPausedUntil,
+        Date.now() + algo.earlyStopPauseMs
+      );
+      console.log(`[LEARN BUY PAUSE] early stop loss, pausing ${Math.round(algo.earlyStopPauseMs / 1000)}s`);
+    }
 
     if (memory.stats.lossStreak >= algo.lossPauseCount) {
       buyPausedUntil = Date.now() + algo.lossPauseMs;
