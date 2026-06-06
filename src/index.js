@@ -1,5 +1,6 @@
 let isLoopRunning = false;
-let loopIntervalId = null;
+let loopTimerId = null;
+let isShuttingDown = false;
 
 const config = require('./config');
 
@@ -44,10 +45,11 @@ function portfolioExposureRate(portfolio) {
 
 function shutdown(reason, code = 0) {
   console.log(`[SHUTDOWN] ${reason}`);
+  isShuttingDown = true;
 
-  if (loopIntervalId) {
-    clearInterval(loopIntervalId);
-    loopIntervalId = null;
+  if (loopTimerId) {
+    clearTimeout(loopTimerId);
+    loopTimerId = null;
   }
 
   process.exit(code);
@@ -333,6 +335,7 @@ async function mainLoop() {
   }
 
   isLoopRunning = true;
+  const startedAt = Date.now();
 
   try {
     const portfolio = await getPortfolio();
@@ -355,7 +358,13 @@ async function mainLoop() {
   } catch (err) {
     console.error(`[ERROR] ${err.stack || err.message}`);
   } finally {
+    const elapsedMs = Date.now() - startedAt;
     isLoopRunning = false;
+
+    if (!isShuttingDown) {
+      console.log(`[LOOP DONE] ${Math.round(elapsedMs / 1000)}s / next ${Math.round(config.pollMs / 1000)}s`);
+      loopTimerId = setTimeout(mainLoop, config.pollMs);
+    }
   }
 }
 
@@ -371,8 +380,6 @@ async function start() {
   console.log(`DIVIDEND_SYSTEM_AVAILABLE=${config.dividendSystemAvailable}`);
 
   await mainLoop();
-
-  loopIntervalId = setInterval(mainLoop, config.pollMs);
 }
 
 start();
