@@ -53,10 +53,7 @@ const config = {
   timeExitLossRate: numberEnv('TIME_EXIT_LOSS_RATE', -0.8),
   minShortMomentum: numberEnv('MIN_SHORT_MOMENTUM', 0.8),
 
-  dividendModeStartHour: numberEnv('DIVIDEND_MODE_START_HOUR', 23),
-  dividendModeStartMinute: numberEnv('DIVIDEND_MODE_START_MINUTE', 40),
-  dividendModeEndHour: numberEnv('DIVIDEND_MODE_END_HOUR', 0),
-  dividendModeEndMinute: numberEnv('DIVIDEND_MODE_END_MINUTE', 5),
+  dividendSystemAvailable: boolEnv('DIVIDEND_SYSTEM_AVAILABLE', true),
 };
 
 module.exports = config;

@@ -1,194 +1,212 @@
+const fs = require('fs');
+const path = require('path');
+
 const config = require('./config');
-
-const lastBuyAt = new Map();
-const lastExitAt = new Map();
-const holdingPeaks = new Map();
-const holdingFirstSeenAt = new Map();
-const buyConfirmMap = new Map();
-
-// LIVE 전환 추적용
-const lastLiveState = new Map();
-const liveStartedAt = new Map();
-let liveStateSeeded = false;
-let lastAnyBuyAt = 0;
-let consecutiveLossSells = 0;
-let buyPausedUntil = 0;
 
 function numberEnv(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
 }
 
+const MEMORY_PATH = path.join(__dirname, '..', 'data', 'strategy-memory.json');
+
+const DEFAULT_WEIGHTS = Object.freeze({
+  bias: 0,
+  momentum1h: 1.05,
+  momentumShort: 0.95,
+  momentumMicro: 0.35,
+  momentumRecent: 0.85,
+  trend: 1.25,
+  rangeSweetSpot: 0.8,
+  pullbackHealth: 0.55,
+  volatility: -0.8,
+  downStreak: -0.65,
+  highChaseRisk: -1.1,
+  live: 0.35,
+  liveStart: 0.55,
+  typeBlueChip: 0.45,
+  typeGrowth: 0.2,
+  typeNew: -0.15,
+  typeIpo: -0.45,
+});
+
 const algo = {
-  evaluateTopN: numberEnv('EVALUATE_TOP_N', 100),
-  maxBuysPerLoop: numberEnv('MAX_BUYS_PER_LOOP', 1),
-  buyScoreThreshold: numberEnv('BUY_SCORE_THRESHOLD', 13),
+  evaluateTopN: numberEnv('LEARN_EVALUATE_TOP_N', numberEnv('EVALUATE_TOP_N', 160)),
+  maxBuysPerLoop: numberEnv('LEARN_MAX_BUYS_PER_LOOP', numberEnv('MAX_BUYS_PER_LOOP', 2)),
+  baseScoreThreshold: numberEnv('LEARN_BUY_SCORE_THRESHOLD', 1.6),
+  minScoreThreshold: numberEnv('LEARN_MIN_SCORE_THRESHOLD', 0.8),
+  maxScoreThreshold: numberEnv('LEARN_MAX_SCORE_THRESHOLD', 3.8),
 
-  minMomentum1h: numberEnv('MIN_MOMENTUM_1H', 1.2),
-  maxMomentum1h: numberEnv('MAX_MOMENTUM_1H', 24),
-  maxVolatility1h: numberEnv('MAX_VOLATILITY_1H', 24),
-  maxPullbackFromHigh: numberEnv('MAX_PULLBACK_FROM_HIGH', -2.2),
+  learningRate: numberEnv('LEARN_RATE', 0.08),
+  weightDecay: numberEnv('LEARN_WEIGHT_DECAY', 0.006),
+  rewardScaleRate: numberEnv('LEARN_REWARD_SCALE_RATE', 8),
+  memoryMaxClosedTrades: numberEnv('LEARN_MEMORY_MAX_TRADES', 240),
 
-  trailingStartRate: numberEnv('TRAILING_START_RATE', 0.9),
-  trailingDropRate: numberEnv('TRAILING_DROP_RATE', -0.7),
+  explorationRate: numberEnv('LEARN_EXPLORATION_RATE', 0.06),
+  explorationBonus: numberEnv('LEARN_EXPLORATION_BONUS', 0.35),
 
-  maxEntryPrice: numberEnv('MAX_ENTRY_PRICE', 140000),
-  buyConfirmCount: numberEnv('BUY_CONFIRM_COUNT', 2),
-  buyConfirmWindowMs: numberEnv('BUY_CONFIRM_WINDOW_MS', 70000),
-  minMicroMomentum: numberEnv('MIN_MICRO_MOMENTUM', -0.1),
-  minRecentMomentum: numberEnv('MIN_RECENT_MOMENTUM', 0.15),
-  recentMomentumLookbackTicks: numberEnv('RECENT_MOMENTUM_LOOKBACK_TICKS', 8),
-  trendWindowTicks: numberEnv('TREND_WINDOW_TICKS', 12),
-  minTrendConsistency: numberEnv('MIN_TREND_CONSISTENCY', 0.48),
-  maxConsecutiveDownTicks: numberEnv('MAX_CONSECUTIVE_DOWN_TICKS', 2),
-  minRangePosition: numberEnv('MIN_RANGE_POSITION', 0.35),
-  overheatRangePosition: numberEnv('OVERHEAT_RANGE_POSITION', 0.94),
-  overheatMicroMomentum: numberEnv('OVERHEAT_MICRO_MOMENTUM', 1.5),
-  highChaseMomentum1h: numberEnv('HIGH_CHASE_MOMENTUM_1H', 7),
-  highChaseRangePosition: numberEnv('HIGH_CHASE_RANGE_POSITION', 0.96),
-  highChaseMaxPullbackFromHigh: numberEnv('HIGH_CHASE_MAX_PULLBACK_FROM_HIGH', -0.25),
-  maxShortMomentum: numberEnv('MAX_SHORT_MOMENTUM', 6),
-  maxMicroMomentum: numberEnv('MAX_MICRO_MOMENTUM', 4),
-  maxRecentMomentum: numberEnv('MAX_RECENT_MOMENTUM', 6),
-  lateSpikeMomentum1h: numberEnv('LATE_SPIKE_MOMENTUM_1H', 10),
-  lateSpikeShortMomentum: numberEnv('LATE_SPIKE_SHORT_MOMENTUM', 5),
-  lateSpikeRangePosition: numberEnv('LATE_SPIKE_RANGE_POSITION', 0.86),
-  breakoutRangePosition: numberEnv('BREAKOUT_RANGE_POSITION', 0.98),
-  breakoutMaxPullbackFromHigh: numberEnv('BREAKOUT_MAX_PULLBACK_FROM_HIGH', -0.2),
-  breakoutMinScore: numberEnv('BREAKOUT_MIN_SCORE', 16),
-  breakoutMinTrendConsistency: numberEnv('BREAKOUT_MIN_TREND_CONSISTENCY', 0.75),
-  targetRegularPositions: numberEnv('TARGET_REGULAR_POSITIONS', 6),
-  regularPositionCashRate: numberEnv('REGULAR_POSITION_CASH_RATE', 16),
-  regularMinPositionCash: numberEnv('REGULAR_MIN_POSITION_CASH', 50000),
-  enablePositionRotation: boolEnv('ENABLE_POSITION_ROTATION', false),
-  rotationMinNewScore: numberEnv('ROTATION_MIN_NEW_SCORE', 34),
-  rotationMaxExitProfitRate: numberEnv('ROTATION_MAX_EXIT_PROFIT_RATE', 0.5),
-  rotationForceExitLossRate: numberEnv('ROTATION_FORCE_EXIT_LOSS_RATE', -5),
-  rotationMinHoldMs: numberEnv('ROTATION_MIN_HOLD_MS', 180000),
-  chopPenaltyWeight: numberEnv('CHOP_PENALTY_WEIGHT', 0.35),
-  liveStockScoreBonus: numberEnv('LIVE_STOCK_SCORE_BONUS', 0.6),
-  stockTypeBlueChipWeight: numberEnv('STOCK_TYPE_BLUE_CHIP_WEIGHT', 0.8),
-  stockTypeGrowthWeight: numberEnv('STOCK_TYPE_GROWTH_WEIGHT', 0.3),
-  stockTypeNewWeight: numberEnv('STOCK_TYPE_NEW_WEIGHT', -0.2),
-  stockTypeIpoWeight: numberEnv('STOCK_TYPE_IPO_WEIGHT', -1.2),
+  priceFetchConcurrency: numberEnv('LEARN_PRICE_FETCH_CONCURRENCY', numberEnv('PRICE_FETCH_CONCURRENCY', 8)),
+  confirmCandidatesN: numberEnv('LEARN_CONFIRM_CANDIDATES_N', numberEnv('CONFIRM_CANDIDATES_N', 8)),
+  buyConfirmCount: numberEnv('LEARN_BUY_CONFIRM_COUNT', 1),
+  buyConfirmWindowMs: numberEnv('LEARN_BUY_CONFIRM_WINDOW_MS', 60000),
+  waitLogTopN: numberEnv('LEARN_WAIT_LOG_TOP_N', numberEnv('WAIT_LOG_TOP_N', 4)),
 
-  priceFetchConcurrency: numberEnv('PRICE_FETCH_CONCURRENCY', 8),
-  confirmCandidatesN: numberEnv('CONFIRM_CANDIDATES_N', 5),
-  waitLogTopN: numberEnv('WAIT_LOG_TOP_N', 4),
+  maxEntryPrice: numberEnv('LEARN_MAX_ENTRY_PRICE', numberEnv('MAX_ENTRY_PRICE', 300000)),
+  minChangeRateOnEntry: numberEnv('LEARN_MIN_CHANGE_RATE_ON_ENTRY', -35),
+  minMomentum1h: numberEnv('LEARN_MIN_MOMENTUM_1H', -3.5),
+  maxMomentum1h: numberEnv('LEARN_MAX_MOMENTUM_1H', 32),
+  maxVolatility1h: numberEnv('LEARN_MAX_VOLATILITY_1H', 42),
+  maxPullbackFromHigh: numberEnv('LEARN_MAX_PULLBACK_FROM_HIGH', -18),
+  highChaseRangePosition: numberEnv('LEARN_HIGH_CHASE_RANGE_POSITION', 0.985),
+  highChaseMicroMomentum: numberEnv('LEARN_HIGH_CHASE_MICRO_MOMENTUM', 4.5),
 
-  liveTransitionBoost: numberEnv('LIVE_TRANSITION_BOOST', 8),
-  liveTransitionWindowMs: numberEnv('LIVE_TRANSITION_WINDOW_MS', 900000),
-  liveTransitionRelaxMomentum: numberEnv('LIVE_TRANSITION_RELAX_MOMENTUM', 0.7),
-  liveTransitionRelaxScore: numberEnv('LIVE_TRANSITION_RELAX_SCORE', 3),
+  positionCashRate: numberEnv('LEARN_POSITION_CASH_RATE', 18),
+  minPositionCash: numberEnv('LEARN_MIN_POSITION_CASH', 30000),
+  minRiskMultiplier: numberEnv('LEARN_MIN_RISK_MULTIPLIER', 0.45),
+  maxRiskMultiplier: numberEnv('LEARN_MAX_RISK_MULTIPLIER', 1.35),
+  maxPortfolioExposureRate: numberEnv('LEARN_MAX_PORTFOLIO_EXPOSURE_RATE', 95),
 
-  dividendMaxPositions: numberEnv('DIVIDEND_MAX_POSITIONS', 3),
-  dividendBuyQuantity: numberEnv('DIVIDEND_BUY_QUANTITY', 2),
-  dividendStopLossRate: numberEnv('DIVIDEND_STOP_LOSS_RATE', -5),
-  dividendMinScore: numberEnv('DIVIDEND_MIN_SCORE', 10),
+  globalCooldownMs: numberEnv('LEARN_BUY_GLOBAL_COOLDOWN_MS', 15000),
+  lossPauseCount: numberEnv('LEARN_LOSS_PAUSE_COUNT', 3),
+  lossPauseMs: numberEnv('LEARN_LOSS_PAUSE_MS', 180000),
 
-  buyGlobalCooldownMs: numberEnv('BUY_GLOBAL_COOLDOWN_MS', 45000),
-  lossPauseCount: numberEnv('LOSS_PAUSE_COUNT', 2),
-  lossPauseMs: numberEnv('LOSS_PAUSE_MS', 180000),
-  holdingLossBlockRate: numberEnv('HOLDING_LOSS_BLOCK_RATE', -0.3),
-
-  dividendAggressiveStartHour: numberEnv('DIVIDEND_AGGRESSIVE_START_HOUR', 23),
-  dividendAggressiveStartMinute: numberEnv('DIVIDEND_AGGRESSIVE_START_MINUTE', 50),
-  dividendCashReserve: numberEnv('DIVIDEND_CASH_RESERVE', 30000),
-  dividendMaxBuyCashPerTradeRate: numberEnv('DIVIDEND_MAX_BUY_CASH_PER_TRADE_RATE', 60),
-  dividendAddBuyQuantity: numberEnv('DIVIDEND_ADD_BUY_QUANTITY', 3),
-
-  earlyStopMs: numberEnv('EARLY_STOP_MS', 90000),
-  earlyStopMinMs: numberEnv('EARLY_STOP_MIN_MS', 0),
-  earlyStopLossRate: numberEnv('EARLY_STOP_LOSS_RATE', -0.8),
-  panicMinHoldMs: numberEnv('PANIC_MIN_HOLD_MS', 30000),
-  panicMinPeakProfitRate: numberEnv('PANIC_MIN_PEAK_PROFIT_RATE', 0),
-  panicPeakDrawdownRate: numberEnv('PANIC_PEAK_DRAWDOWN_RATE', -1.8),
-  timeExitNeutralRate: numberEnv('TIME_EXIT_NEUTRAL_RATE', -0.15),
-
-  dividendRateWeight: numberEnv('DIVIDEND_RATE_WEIGHT', 1.2),
-  dividendCountWeight: numberEnv('DIVIDEND_COUNT_WEIGHT', 1.0),
-  dividendRateWalkDog: numberEnv('DIVIDEND_RATE_WALKDOG', 3),
-  dividendRateNative: numberEnv('DIVIDEND_RATE_NATIVE', 15),
-  dividendRateUnknownTier: numberEnv('DIVIDEND_RATE_UNKNOWN_TIER', 0),
-
+  stopLossRate: numberEnv('LEARN_STOP_LOSS_RATE', config.stopLossRate),
+  takeProfitRate: numberEnv('LEARN_TAKE_PROFIT_RATE', config.takeProfitRate),
+  trailingStartRate: numberEnv('LEARN_TRAILING_START_RATE', 3.2),
+  trailingDropRate: numberEnv('LEARN_TRAILING_DROP_RATE', -1.35),
+  earlyStopMinMs: numberEnv('LEARN_EARLY_STOP_MIN_MS', 90000),
+  earlyStopMs: numberEnv('LEARN_EARLY_STOP_MS', 900000),
+  earlyStopLossRate: numberEnv('LEARN_EARLY_STOP_LOSS_RATE', -5.5),
+  timeExitNeutralRate: numberEnv('LEARN_TIME_EXIT_NEUTRAL_RATE', 0.15),
 };
 
-function nowKstMinutes() {
-  const now = new Date();
-  const kst = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
-  return kst.getHours() * 60 + kst.getMinutes();
+const lastBuyAt = new Map();
+const lastExitAt = new Map();
+const holdingPeaks = new Map();
+const holdingFirstSeenAt = new Map();
+const buyConfirmMap = new Map();
+const lastLiveState = new Map();
+const liveStartedAt = new Map();
+
+let liveStateSeeded = false;
+let lastAnyBuyAt = 0;
+let buyPausedUntil = 0;
+let memory = loadMemory();
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
-function boolEnv(name, fallback = false) {
-  const raw = process.env[name];
-  if (raw === undefined) return fallback;
-  return String(raw).trim().toLowerCase() === 'true';
+function cleanNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }
 
-function hasHoldingLoss(portfolio) {
-  return (portfolio.holdings || [])
-    .some(h => Number(h.profitRate || 0) <= algo.holdingLossBlockRate);
+function defaultMemory() {
+  return {
+    version: 1,
+    scoreThreshold: algo.baseScoreThreshold,
+    riskMultiplier: 1,
+    weights: { ...DEFAULT_WEIGHTS },
+    stats: {
+      buys: 0,
+      sells: 0,
+      wins: 0,
+      losses: 0,
+      lossStreak: 0,
+      winStreak: 0,
+      realizedProfitRateSum: 0,
+    },
+    openTrades: {},
+    closedTrades: [],
+    updatedAt: new Date().toISOString(),
+  };
 }
 
-function canOpenNewPosition(portfolio) {
-  const now = Date.now();
+function normalizeMemory(raw) {
+  const base = defaultMemory();
 
-  if (now < buyPausedUntil) {
-    console.log(`[BUY PAUSE] 손절 연속 발생으로 매수 중단 중: ${Math.ceil((buyPausedUntil - now) / 1000)}초 남음`);
-    return false;
+  if (!raw || typeof raw !== 'object') return base;
+
+  return {
+    ...base,
+    ...raw,
+    scoreThreshold: cleanNumber(raw.scoreThreshold, base.scoreThreshold),
+    riskMultiplier: cleanNumber(raw.riskMultiplier, base.riskMultiplier),
+    weights: {
+      ...base.weights,
+      ...(raw.weights || {}),
+    },
+    stats: {
+      ...base.stats,
+      ...(raw.stats || {}),
+    },
+    openTrades: raw.openTrades && typeof raw.openTrades === 'object'
+      ? raw.openTrades
+      : {},
+    closedTrades: Array.isArray(raw.closedTrades)
+      ? raw.closedTrades.slice(-algo.memoryMaxClosedTrades)
+      : [],
+  };
+}
+
+function loadMemory() {
+  try {
+    if (!fs.existsSync(MEMORY_PATH)) return defaultMemory();
+    const raw = JSON.parse(fs.readFileSync(MEMORY_PATH, 'utf8'));
+    return normalizeMemory(raw);
+  } catch (err) {
+    console.log(`[LEARN MEMORY] failed to load memory, starting fresh: ${err.message}`);
+    return defaultMemory();
   }
-
-  if (now - lastAnyBuyAt < algo.buyGlobalCooldownMs) {
-    return false;
-  }
-
-  if (
-    boolEnv('BLOCK_BUY_WHEN_HOLDING_LOSS', true) &&
-    hasHoldingLoss(portfolio)
-  ) {
-    console.log('[BUY BLOCK] 보유 종목 중 손실 종목이 있어 신규매수 보류');
-    return false;
-  }
-
-  return true;
 }
 
-function isDividendMode() {
-  const current = nowKstMinutes();
-
-  const start =
-    config.dividendModeStartHour * 60 + config.dividendModeStartMinute;
-
-  const end =
-    config.dividendModeEndHour * 60 + config.dividendModeEndMinute;
-
-  // 23:40 ~ 00:05처럼 자정 넘기는 구간
-  if (start > end) {
-    return current >= start || current <= end;
+function saveMemory() {
+  try {
+    fs.mkdirSync(path.dirname(MEMORY_PATH), { recursive: true });
+    memory.updatedAt = new Date().toISOString();
+    fs.writeFileSync(MEMORY_PATH, JSON.stringify(memory, null, 2));
+  } catch (err) {
+    console.log(`[LEARN MEMORY] failed to save memory: ${err.message}`);
   }
-
-  return current >= start && current <= end;
 }
 
-function isDividendAggressiveMode() {
-  if (!isDividendMode()) return false;
+function percentChange(from, to) {
+  if (!from || from <= 0) return 0;
+  return ((to - from) / from) * 100;
+}
 
-  const current = nowKstMinutes();
+function holdingValue(holding) {
+  return cleanNumber(holding.currentPrice) * cleanNumber(holding.quantity);
+}
 
-  const start =
-    algo.dividendAggressiveStartHour * 60 +
-    algo.dividendAggressiveStartMinute;
+function portfolioAsset(portfolio) {
+  const totalAsset = cleanNumber(portfolio.me?.totalAsset);
+  if (totalAsset > 0) return totalAsset;
 
-  return current >= start;
+  const balance = cleanNumber(portfolio.me?.balance);
+  const holdingsValue = (portfolio.holdings || [])
+    .reduce((sum, holding) => sum + holdingValue(holding), 0);
+
+  return Math.max(0, balance + holdingsValue);
+}
+
+function portfolioExposureRate(portfolio) {
+  const asset = portfolioAsset(portfolio);
+  if (asset <= 0) return 0;
+
+  const holdingsValue = (portfolio.holdings || [])
+    .reduce((sum, holding) => sum + holdingValue(holding), 0);
+
+  return (holdingsValue / asset) * 100;
 }
 
 function canBuy(stockId) {
   const now = Date.now();
   const lastBuy = lastBuyAt.get(stockId) || 0;
   const lastExit = lastExitAt.get(stockId) || 0;
-  const last = Math.max(lastBuy, lastExit);
 
-  return now - last >= config.tradeCooldownMs;
+  return now - Math.max(lastBuy, lastExit) >= config.tradeCooldownMs;
 }
 
 function markBought(stockId) {
@@ -212,142 +230,51 @@ function makeHoldingMap(portfolio) {
   return map;
 }
 
-function holdingValue(holding) {
-  return Number(holding.currentPrice || 0) * Number(holding.quantity || 0);
-}
+function hasDividendSystemInfo(stock) {
+  if (!config.dividendSystemAvailable) return false;
 
-function portfolioAsset(portfolio) {
-  const totalAsset = Number(portfolio.me?.totalAsset || 0);
-  if (Number.isFinite(totalAsset) && totalAsset > 0) {
-    return totalAsset;
-  }
+  const values = [
+    stock.dividendRate,
+    stock.dividend_rate,
+    stock.dividendCount,
+    stock.dividend_count,
+    stock.dividendGrade,
+    stock.oshiDividendRate,
+    stock.oshi_dividend_rate,
+    stock.oshiDividendCount,
+    stock.oshi_dividend_count,
+    stock.oshiGrade,
+    stock.oshi?.dividendRate,
+    stock.oshi?.dividendCount,
+    stock.dividend?.rate,
+    stock.dividend?.count,
+  ];
 
-  const balance = Number(portfolio.me?.balance || 0);
-  const holdingsValue = (portfolio.holdings || [])
-    .reduce((sum, holding) => sum + holdingValue(holding), 0);
-
-  return Math.max(0, balance + holdingsValue);
-}
-
-function getDividendInfo(stock) {
-  const gradeRaw =
-    stock.oshiGrade ??
-    stock.grade ??
-    stock.oshiLevel ??
-    stock.oshiRank ??
-    stock.oshi?.grade ??
-    stock.oshi?.level ??
-    stock.dividendGrade ??
-    '';
-
-  const grade = String(gradeRaw || '');
-
-  let rate = Number(
-    stock.dividendRate ??
-    stock.dividend_rate ??
-    stock.oshiDividendRate ??
-    stock.oshi_dividend_rate ??
-    stock.oshi?.dividendRate ??
-    stock.dividend?.rate
-  );
-
-  let count = Number(
-    stock.dividendCount ??
-    stock.dividend_count ??
-    stock.oshiDividendCount ??
-    stock.oshi_dividend_count ??
-    stock.oshi?.dividendCount ??
-    stock.dividend?.count
-  );
-
-  if (!Number.isFinite(rate)) rate = 0;
-  if (!Number.isFinite(count)) count = 0;
-
-  if (rate <= 0) {
-    if (grade.includes('산책견')) {
-      rate = algo.dividendRateWalkDog;
-      if (count <= 0) count = 1;
-    } else if (grade.includes('원주민')) {
-      rate = algo.dividendRateNative;
-      if (count <= 0) count = 3;
-    } else if (grade.includes('???')) {
-      rate = algo.dividendRateUnknownTier;
-      if (count <= 0) count = 8;
-    }
-  }
-
-  return { grade, rate, count };
-}
-
-function getDividendScoreBonus(stock) {
-  const info = getDividendInfo(stock);
-
-  const bonus =
-    Math.max(0, info.rate) * algo.dividendRateWeight +
-    Math.max(0, info.count) * algo.dividendCountWeight;
-
-  return {
-    ...info,
-    bonus,
-  };
-}
-
-function getDividendTopHoldingIds(portfolio) {
-  return new Set(
-    [...(portfolio.holdings || [])]
-      .sort((a, b) => holdingValue(b) - holdingValue(a))
-      .slice(0, algo.dividendMaxPositions)
-      .map(h => h.stockId)
-  );
-}
-
-function percentChange(from, to) {
-  if (!from || from <= 0) return 0;
-  return ((to - from) / from) * 100;
-}
-
-function getStockTypeWeight(stock) {
-  const type = String(stock.stockType || '').toUpperCase();
-
-  if (type === 'BLUE_CHIP') return algo.stockTypeBlueChipWeight;
-  if (type === 'GROWTH') return algo.stockTypeGrowthWeight;
-  if (type === 'NEW') return algo.stockTypeNewWeight;
-  if (type === 'IPO') return algo.stockTypeIpoWeight;
-
-  return 0;
+  return values.some(value => value !== undefined && value !== null && value !== '');
 }
 
 function analyzePricePoints(points, fallbackPrice) {
   const valid = (points || [])
-    .filter(p => Number.isFinite(Number(p.price)))
+    .filter(point => Number.isFinite(Number(point.price)))
     .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
-    .map(p => Number(p.price));
+    .map(point => Number(point.price));
 
-  if (valid.length < 5) {
-    return null;
-  }
+  if (valid.length < 5) return null;
 
   const first = valid[0];
-  const last = fallbackPrice || valid[valid.length - 1];
+  const last = cleanNumber(fallbackPrice, valid[valid.length - 1]);
   const high = Math.max(...valid, last);
   const low = Math.min(...valid, last);
-
   const shortBase = valid[Math.max(0, valid.length - 4)];
   const microBase = valid[Math.max(0, valid.length - 2)];
-  const recentBase = valid[
-    Math.max(0, valid.length - Math.max(2, algo.recentMomentumLookbackTicks))
-  ];
-
-  const trendWindow = valid.slice(
-    Math.max(0, valid.length - Math.max(3, algo.trendWindowTicks))
-  );
+  const recentBase = valid[Math.max(0, valid.length - 8)];
+  const trendWindow = valid.slice(Math.max(0, valid.length - 12));
 
   let upTicks = 0;
   let downTicks = 0;
 
   for (let i = 1; i < trendWindow.length; i++) {
     const diff = trendWindow[i] - trendWindow[i - 1];
-
     if (diff > 0) upTicks += 1;
     if (diff < 0) downTicks += 1;
   }
@@ -359,147 +286,22 @@ function analyzePricePoints(points, fallbackPrice) {
     consecutiveDownTicks += 1;
   }
 
-  const momentum1h = percentChange(first, last);
-  const momentumShort = percentChange(shortBase, last);
-  const momentumMicro = percentChange(microBase, last);
-  const momentumRecent = percentChange(recentBase, last);
-  const pullbackFromHigh = percentChange(high, last);
-  const volatility1h = percentChange(low, high);
   const trendTickCount = upTicks + downTicks;
-  const trendConsistency = trendTickCount > 0 ? upTicks / trendTickCount : 0;
-  const rangePosition = high > low ? (last - low) / (high - low) : 0.5;
 
   return {
     first,
     last,
     high,
     low,
-    momentum1h,
-    momentumShort,
-    momentumMicro,
-    momentumRecent,
-    pullbackFromHigh,
-    volatility1h,
-    trendConsistency,
+    momentum1h: percentChange(first, last),
+    momentumShort: percentChange(shortBase, last),
+    momentumMicro: percentChange(microBase, last),
+    momentumRecent: percentChange(recentBase, last),
+    pullbackFromHigh: percentChange(high, last),
+    volatility1h: percentChange(low, high),
+    trendConsistency: trendTickCount > 0 ? upTicks / trendTickCount : 0.5,
     consecutiveDownTicks,
-    rangePosition,
-  };
-}
-
-function getAdaptiveBuyQuantity(stock, dividendMode) {
-  const price = Number(stock.currentPrice || 0);
-
-  if (dividendMode) {
-    return algo.dividendBuyQuantity;
-  }
-
-  const multiBuyPriceLimit = numberEnv('MULTI_BUY_PRICE_LIMIT', 70000);
-  const multiBuyQuantity = numberEnv('MULTI_BUY_QUANTITY', 2);
-
-  if (price > 0 && price <= multiBuyPriceLimit) {
-    return Math.max(config.buyQuantity, multiBuyQuantity);
-  }
-
-  return config.buyQuantity;
-}
-
-function getRegularBuySizing(stock, portfolio) {
-  const price = Number(stock.currentPrice || 0);
-  const totalAsset = portfolioAsset(portfolio);
-  const targetBySlots = Math.floor(
-    totalAsset / Math.max(1, algo.targetRegularPositions)
-  );
-  const targetByRate = Math.floor(
-    totalAsset * (algo.regularPositionCashRate / 100)
-  );
-  const targetCash = Math.max(
-    config.minBuyCash,
-    algo.regularMinPositionCash,
-    Math.min(targetBySlots, targetByRate)
-  );
-
-  if (!Number.isFinite(price) || price <= 0) {
-    return {
-      quantity: config.buyQuantity,
-      targetCash,
-    };
-  }
-
-  return {
-    quantity: Math.max(config.buyQuantity, Math.round(targetCash / price)),
-    targetCash,
-  };
-}
-
-function getHoldingMs(stockId) {
-  const firstSeenAt = holdingFirstSeenAt.get(stockId);
-  return firstSeenAt ? Date.now() - firstSeenAt : Infinity;
-}
-
-function isRotationExitCandidate(holding, reservedIds = new Set()) {
-  if (!algo.enablePositionRotation) return false;
-  if (!holding || reservedIds.has(holding.stockId)) return false;
-
-  const quantity = Number(holding.quantity || 0);
-  const profitRate = Number(holding.profitRate || 0);
-
-  if (quantity <= 0) return false;
-  if (!Number.isFinite(profitRate)) return false;
-  if (profitRate > algo.rotationMaxExitProfitRate) return false;
-
-  const holdingMs = getHoldingMs(holding.stockId);
-  if (
-    holdingMs < algo.rotationMinHoldMs &&
-    profitRate > algo.rotationForceExitLossRate
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function getRotationCash(portfolio) {
-  if (!algo.enablePositionRotation || isDividendMode()) return 0;
-
-  return (portfolio.holdings || [])
-    .filter(holding => isRotationExitCandidate(holding))
-    .reduce((maxCash, holding) => Math.max(maxCash, holdingValue(holding)), 0);
-}
-
-function selectRotationExitHolding(portfolio, signal, reservedIds = new Set()) {
-  if (!algo.enablePositionRotation) return null;
-  if (isDividendMode() || isDividendAggressiveMode()) return null;
-  if (signal.allowAddToHolding) return null;
-  if (Number(signal.score || 0) < algo.rotationMinNewScore) return null;
-  if ((portfolio.holdings || []).length < config.maxPositions) return null;
-
-  const candidates = (portfolio.holdings || [])
-    .filter(holding => holding.stockId !== signal.stockId)
-    .filter(holding => isRotationExitCandidate(holding, reservedIds))
-    .sort((a, b) => {
-      const profitDiff = Number(a.profitRate || 0) - Number(b.profitRate || 0);
-      if (profitDiff !== 0) return profitDiff;
-
-      return holdingValue(b) - holdingValue(a);
-    });
-
-  return candidates[0] || null;
-}
-
-function addRotationPlan(signal, holding) {
-  if (!holding) return signal;
-
-  const profitRate = Number(holding.profitRate || 0);
-
-  return {
-    ...signal,
-    reason:
-      `${signal.reason} / 로테이션 ${holding.stockName} ` +
-      `${profitRate.toFixed(1)}% 대체`,
-    rotateOutStockId: holding.stockId,
-    rotateOutStockName: holding.stockName,
-    rotateOutQuantity: holding.quantity,
-    rotateOutProfitRate: profitRate,
+    rangePosition: high > low ? (last - low) / (high - low) : 0.5,
   };
 }
 
@@ -511,7 +313,6 @@ function updateLiveTransitions(stocks) {
     const currentLive = stock.isLive === true;
     const prevLive = lastLiveState.get(id);
 
-    // 첫 루프에서는 현재 상태만 저장하고 전환으로 보지 않음
     if (liveStateSeeded && prevLive === false && currentLive === true) {
       liveStartedAt.set(id, now);
     }
@@ -526,338 +327,227 @@ function isLiveJustStarted(stockId) {
   const startedAt = liveStartedAt.get(stockId);
   if (!startedAt) return false;
 
-  return Date.now() - startedAt <= algo.liveTransitionWindowMs;
+  return Date.now() - startedAt <= 120000;
 }
 
-function getLiveAgeText(stockId) {
-  const startedAt = liveStartedAt.get(stockId);
-  if (!startedAt) return '';
+function stockTypeFeatures(stock) {
+  const type = String(stock.stockType || '').toUpperCase();
 
-  const ageMs = Date.now() - startedAt;
-  if (ageMs > algo.liveTransitionWindowMs) return '';
-
-  const sec = Math.round(ageMs / 1000);
-  return ` / live+${sec}s`;
+  return {
+    typeBlueChip: type === 'BLUE_CHIP' ? 1 : 0,
+    typeGrowth: type === 'GROWTH' ? 1 : 0,
+    typeNew: type === 'NEW' ? 1 : 0,
+    typeIpo: type === 'IPO' ? 1 : 0,
+  };
 }
 
-function getSellSignals(portfolio) {
-  const signals = [];
-  const currentHoldingIds = new Set();
-  const dividendMode = isDividendMode();
-  const dividendTopIds = getDividendTopHoldingIds(portfolio);
-
-  for (const holding of portfolio.holdings || []) {
-    const stockId = holding.stockId;
-    currentHoldingIds.add(stockId);
-
-    const currentPrice = Number(holding.currentPrice);
-    if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
-
-    const prevPeak = holdingPeaks.get(stockId) || currentPrice;
-    const newPeak = Math.max(prevPeak, currentPrice);
-    holdingPeaks.set(stockId, newPeak);
-
-    if (!holdingFirstSeenAt.has(stockId)) {
-      holdingFirstSeenAt.set(stockId, Date.now());
-    }
-
-    const firstSeenAt = holdingFirstSeenAt.get(stockId);
-    const holdingMs = Date.now() - firstSeenAt;
-    const averagePrice = Number(holding.averagePrice || 0);
-    const peakDrawdown = percentChange(newPeak, currentPrice);
-    const peakProfitRate = averagePrice > 0
-      ? percentChange(averagePrice, newPeak)
+function makeFeatures(stock, analysis) {
+  const rangeSweetSpot = 1 - Math.abs(analysis.rangePosition - 0.68) / 0.45;
+  const highChaseRisk =
+    analysis.rangePosition >= algo.highChaseRangePosition &&
+    analysis.momentumMicro >= algo.highChaseMicroMomentum &&
+    analysis.pullbackFromHigh > -0.2
+      ? 1
       : 0;
 
-    // 배당 모드:
-    // 상위 3개는 자정 배당을 위해 최대한 유지.
-    // 단, 큰 손실은 예외적으로 정리.
-    if (dividendMode) {
-      if (holding.profitRate <= algo.dividendStopLossRate) {
-        signals.push({
-          type: 'SELL',
-          reason: `배당 모드 예외 손절: ${holding.profitRate}%`,
-          stockId,
-          stockName: holding.stockName,
-          quantity: holding.quantity,
-        });
-        continue;
-      }
+  return {
+    momentum1h: clamp(analysis.momentum1h / 12, -1.5, 1.5),
+    momentumShort: clamp(analysis.momentumShort / 6, -1.5, 1.5),
+    momentumMicro: clamp(analysis.momentumMicro / 4, -1.5, 1.5),
+    momentumRecent: clamp(analysis.momentumRecent / 7, -1.5, 1.5),
+    trend: clamp((analysis.trendConsistency - 0.5) * 2, -1, 1),
+    rangeSweetSpot: clamp(rangeSweetSpot, -1, 1),
+    pullbackHealth: clamp((analysis.pullbackFromHigh + 5) / 5, -1, 1),
+    volatility: clamp(analysis.volatility1h / 24, 0, 2),
+    downStreak: clamp(analysis.consecutiveDownTicks / 5, 0, 1),
+    highChaseRisk,
+    live: stock.isLive ? 1 : 0,
+    liveStart: isLiveJustStarted(stock.id) ? 1 : 0,
+    ...stockTypeFeatures(stock),
+  };
+}
 
-      // 배당 상위 3개가 아닌 종목은 살짝 수익이면 정리해서 현금 확보
-      if (!dividendTopIds.has(stockId) && holding.profitRate >= 0.5) {
-        signals.push({
-          type: 'SELL',
-          reason: `배당 모드 비상위 정리: ${holding.profitRate}%`,
-          stockId,
-          stockName: holding.stockName,
-          quantity: holding.quantity,
-        });
-        continue;
-      }
+function weightedScore(features) {
+  const weights = memory.weights || DEFAULT_WEIGHTS;
+  let score = cleanNumber(weights.bias);
 
-      continue;
-    }
-
-    // 일반 모드: 매도에는 쿨다운 없음. 손절/익절 즉시.
-    if (holding.profitRate <= config.stopLossRate) {
-      signals.push({
-        type: 'SELL',
-        reason: `즉시 손절: ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (holding.profitRate >= config.takeProfitRate) {
-      signals.push({
-        type: 'SELL',
-        reason: `스윙 익절: ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (
-      peakProfitRate >= algo.trailingStartRate &&
-      peakDrawdown <= algo.trailingDropRate
-    ) {
-      signals.push({
-        type: 'SELL',
-        reason:
-          `스윙 트레일링: ` +
-          `고점수익 ${peakProfitRate.toFixed(2)}% / ` +
-          `고점 대비 ${peakDrawdown.toFixed(2)}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (
-      holdingMs >= algo.earlyStopMinMs &&
-      holdingMs <= algo.earlyStopMs &&
-      holding.profitRate <= algo.earlyStopLossRate
-    ) {
-      signals.push({
-        type: 'SELL',
-        reason: `초반 실패 손절: ${Math.round(holdingMs / 1000)}초 / ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (
-      holdingMs >= algo.panicMinHoldMs &&
-      peakProfitRate >= algo.panicMinPeakProfitRate &&
-      peakDrawdown <= algo.panicPeakDrawdownRate
-    ) {
-      signals.push({
-        type: 'SELL',
-        reason:
-          `고점 이탈 방어: ` +
-          `고점수익 ${peakProfitRate.toFixed(2)}% / ` +
-          `고점 대비 ${peakDrawdown.toFixed(2)}% / ` +
-          `현재 ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (
-      holdingMs >= config.maxHoldMs &&
-      holding.profitRate >= config.timeExitProfitRate
-    ) {
-      signals.push({
-        type: 'SELL',
-        reason: `시간 청산 익절: ${Math.round(holdingMs / 1000)}초 보유 / ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (
-      holdingMs >= config.maxHoldMs &&
-      holding.profitRate >= algo.timeExitNeutralRate
-    ) {
-      signals.push({
-        type: 'SELL',
-        reason: `시간 청산 보합: ${Math.round(holdingMs / 1000)}초 보유 / ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
-
-    if (
-      holdingMs >= config.maxHoldMs &&
-      holding.profitRate <= config.timeExitLossRate
-    ) {
-      signals.push({
-        type: 'SELL',
-        reason: `시간 청산 손절: ${Math.round(holdingMs / 1000)}초 보유 / ${holding.profitRate}%`,
-        stockId,
-        stockName: holding.stockName,
-        quantity: holding.quantity,
-      });
-      continue;
-    }
+  for (const [key, value] of Object.entries(features)) {
+    score += cleanNumber(weights[key], cleanNumber(DEFAULT_WEIGHTS[key])) * value;
   }
 
-  for (const stockId of holdingFirstSeenAt.keys()) {
-    if (!currentHoldingIds.has(stockId)) {
-      holdingFirstSeenAt.delete(stockId);
-      holdingPeaks.delete(stockId);
-    }
+  return score;
+}
+
+function recentStats(limit = 30) {
+  const recent = (memory.closedTrades || []).slice(-limit);
+
+  if (recent.length === 0) {
+    return {
+      count: 0,
+      winRate: 0,
+      avgProfitRate: 0,
+    };
   }
 
-  return signals;
+  const wins = recent.filter(trade => cleanNumber(trade.profitRate) > 0).length;
+  const sum = recent.reduce(
+    (total, trade) => total + cleanNumber(trade.profitRate),
+    0
+  );
+
+  return {
+    count: recent.length,
+    winRate: wins / recent.length,
+    avgProfitRate: sum / recent.length,
+  };
+}
+
+function currentScoreThreshold() {
+  const stats = recentStats(20);
+  let threshold = cleanNumber(memory.scoreThreshold, algo.baseScoreThreshold);
+
+  if (stats.count >= 5) {
+    if (stats.avgProfitRate < -0.4) threshold += 0.25;
+    if (stats.winRate < 0.42) threshold += 0.2;
+    if (stats.avgProfitRate > 0.8 && stats.winRate > 0.5) threshold -= 0.15;
+  }
+
+  return clamp(threshold, algo.minScoreThreshold, algo.maxScoreThreshold);
+}
+
+function currentRiskMultiplier() {
+  const stats = memory.stats || {};
+  let multiplier = cleanNumber(memory.riskMultiplier, 1);
+
+  if (cleanNumber(stats.lossStreak) >= 2) {
+    multiplier *= 0.65;
+  }
+
+  return clamp(multiplier, algo.minRiskMultiplier, algo.maxRiskMultiplier);
+}
+
+function canOpenNewPosition(portfolio) {
+  const now = Date.now();
+
+  if (now < buyPausedUntil) {
+    console.log(`[LEARN BUY PAUSE] ${Math.ceil((buyPausedUntil - now) / 1000)}s left`);
+    return false;
+  }
+
+  if (now - lastAnyBuyAt < algo.globalCooldownMs) {
+    return false;
+  }
+
+  if (portfolioExposureRate(portfolio) >= algo.maxPortfolioExposureRate) {
+    console.log(`[LEARN BUY BLOCK] exposure ${portfolioExposureRate(portfolio).toFixed(1)}%`);
+    return false;
+  }
+
+  return true;
 }
 
 function preFilterCandidates(stocks, portfolio) {
   updateLiveTransitions(stocks);
 
-  const dividendMode = isDividendMode();
-  const aggressiveDividendMode = isDividendAggressiveMode();
-
-  // 일반 모드에서는 매수 잠금 조건 적용
-  // 공격 배당 모드에서는 현금 소진을 위해 매수 잠금 일부 무시
-  if (!aggressiveDividendMode && !canOpenNewPosition(portfolio)) {
-    return [];
-  }
+  if (!canOpenNewPosition(portfolio)) return [];
 
   const holdings = makeHoldingMap(portfolio);
   const positionCount = portfolio.holdings?.length || 0;
 
-  const maxPositions = dividendMode
-    ? algo.dividendMaxPositions
-    : config.maxPositions;
-
-  const rotationEnabled =
-    algo.enablePositionRotation &&
-    !dividendMode &&
-    !aggressiveDividendMode &&
-    (portfolio.holdings || []).some(holding => isRotationExitCandidate(holding));
-
-  // 일반/배당 준비 모드에서는 최대 종목 수 도달 시 신규매수 중단.
-  // 단, 일반 공격 모드 로테이션이 켜져 있고 교체 가능한 약한 보유종목이 있으면 후보 분석은 진행.
-  // 공격 배당 모드에서는 이미 보유한 종목 추가매수는 허용
-  if (
-    !aggressiveDividendMode &&
-    positionCount >= maxPositions &&
-    !rotationEnabled
-  ) {
-    return [];
-  }
-
-  const cashReserve = aggressiveDividendMode
-    ? algo.dividendCashReserve
-    : config.buyCashReserve;
-
-  const buyCashRate = aggressiveDividendMode
-    ? algo.dividendMaxBuyCashPerTradeRate
-    : config.maxBuyCashPerTradeRate;
+  if (positionCount >= config.maxPositions) return [];
 
   const usableCash = Math.max(
     0,
-    Number(portfolio.me.balance || 0) - cashReserve
+    cleanNumber(portfolio.me?.balance) - config.buyCashReserve
   );
-
-  const effectiveUsableCash =
-    positionCount >= maxPositions && rotationEnabled
-      ? usableCash + getRotationCash(portfolio)
-      : usableCash;
-
   const maxTradeCash = Math.floor(
-    effectiveUsableCash * (buyCashRate / 100)
+    usableCash * (config.maxBuyCashPerTradeRate / 100)
   );
 
-  if (effectiveUsableCash <= 0) return [];
+  if (usableCash <= 0) return [];
   if (maxTradeCash < config.minBuyCash) return [];
 
   return stocks
     .filter(stock => {
-      const alreadyHolding = holdings.has(stock.id);
-
       if (stock.isDelisted) return false;
+      if (holdings.has(stock.id)) return false;
+      if (!canBuy(stock.id)) return false;
 
-      // 일반 모드에서는 이미 보유 중인 종목 추가매수 금지
-      // 공격 배당 모드에서는 보유 종목 추가매수 허용
-      if (alreadyHolding && !aggressiveDividendMode) return false;
-
-      // 공격 배당 모드에서 이미 3종목 들고 있으면 새 종목은 금지하고 기존 보유 종목만 추가매수
-      if (
-        aggressiveDividendMode &&
-        positionCount >= maxPositions &&
-        !alreadyHolding
-      ) {
-        return false;
-      }
-
-      const currentPrice = Number(stock.currentPrice);
-      if (!Number.isFinite(currentPrice)) return false;
+      const currentPrice = cleanNumber(stock.currentPrice);
       if (currentPrice <= 0) return false;
-
       if (currentPrice > algo.maxEntryPrice) return false;
+      if (currentPrice > maxTradeCash) return false;
 
-      if (stock.changeRate > config.maxChangeRateOnEntry) return false;
-      if (stock.changeRate < -20) return false;
+      const changeRate = cleanNumber(stock.changeRate);
+      if (changeRate > config.maxChangeRateOnEntry) return false;
+      if (changeRate < algo.minChangeRateOnEntry) return false;
 
       const bufferedPrice = Math.ceil(
         currentPrice * (1 + config.buyPriceBufferRate / 100)
       );
 
-      if (effectiveUsableCash < bufferedPrice) return false;
-      if (maxTradeCash < bufferedPrice) return false;
-
-      // 공격 배당 모드에서는 같은 종목 쿨다운도 완화
-      if (!aggressiveDividendMode && !canBuy(stock.id)) return false;
-
-      return true;
+      return usableCash >= bufferedPrice && maxTradeCash >= bufferedPrice;
     })
     .sort((a, b) => {
-      const aHolding = holdings.has(a.id) ? 1 : 0;
-      const bHolding = holdings.has(b.id) ? 1 : 0;
-
-      // 공격 배당 모드에서는 이미 보유 중인 종목을 우선 추가매수
-      if (aggressiveDividendMode && bHolding !== aHolding) {
-        return bHolding - aHolding;
-      }
-
       const aJustLive = isLiveJustStarted(a.id) ? 1 : 0;
       const bJustLive = isLiveJustStarted(b.id) ? 1 : 0;
-
       if (bJustLive !== aJustLive) return bJustLive - aJustLive;
 
       const aLive = a.isLive ? 1 : 0;
       const bLive = b.isLive ? 1 : 0;
-
       if (bLive !== aLive) return bLive - aLive;
 
-      const aMovement = Math.min(Math.abs(Number(a.changeRate) || 0), 100);
-      const bMovement = Math.min(Math.abs(Number(b.changeRate) || 0), 100);
-
-      return bMovement - aMovement;
+      return Math.abs(cleanNumber(b.changeRate)) - Math.abs(cleanNumber(a.changeRate));
     })
     .slice(0, algo.evaluateTopN);
+}
+
+function hardRejectReason(stock, analysis) {
+  if (analysis.volatility1h > algo.maxVolatility1h) return 'volatility';
+  if (analysis.momentum1h < algo.minMomentum1h && analysis.trendConsistency < 0.38) {
+    return 'falling';
+  }
+  if (analysis.momentum1h > algo.maxMomentum1h && analysis.rangePosition > 0.92) {
+    return 'overrun';
+  }
+  if (analysis.pullbackFromHigh < algo.maxPullbackFromHigh) return 'deepPullback';
+  if (
+    analysis.rangePosition >= algo.highChaseRangePosition &&
+    analysis.momentumMicro >= algo.highChaseMicroMomentum
+  ) {
+    return 'highChase';
+  }
+
+  return '';
+}
+
+function learnedBuySizing(stock, portfolio, score, threshold) {
+  const currentPrice = cleanNumber(stock.currentPrice);
+  const asset = portfolioAsset(portfolio);
+  const riskMultiplier = currentRiskMultiplier();
+  const qualityMultiplier = clamp(0.75 + (score - threshold) / 3, 0.55, 1.45);
+  const targetCash = Math.max(
+    config.minBuyCash,
+    algo.minPositionCash,
+    Math.floor(asset * (algo.positionCashRate / 100) * riskMultiplier * qualityMultiplier)
+  );
+
+  if (currentPrice <= 0) {
+    return {
+      quantity: config.buyQuantity,
+      targetCash,
+    };
+  }
+
+  return {
+    quantity: Math.max(config.buyQuantity, Math.round(targetCash / currentPrice)),
+    targetCash,
+  };
 }
 
 function updateBuyConfirm(stockId) {
   const now = Date.now();
   const prev = buyConfirmMap.get(stockId);
-
   const count =
     prev && now - prev.lastSeenAt <= algo.buyConfirmWindowMs
       ? prev.count + 1
@@ -881,56 +571,6 @@ function cleanupBuyConfirm() {
   }
 }
 
-function makeDividendForceBuySignals(portfolio) {
-  if (!isDividendAggressiveMode()) {
-    return [];
-  }
-
-  if (!boolEnv('DIVIDEND_FORCE_BUY', true)) {
-    return [];
-  }
-
-  const balance = Number(portfolio.me?.balance || 0);
-  const reserve = algo.dividendCashReserve;
-  const usableCash = Math.max(0, balance - reserve);
-
-  if (usableCash < config.minBuyCash) {
-    return [];
-  }
-
-  const minProfitRate = numberEnv('DIVIDEND_ADD_BUY_MIN_PROFIT_RATE', -5);
-
-  const holdings = [...(portfolio.holdings || [])]
-    .filter(h => Number(h.currentPrice || 0) > 0)
-    .filter(h => Number(h.profitRate || 0) >= minProfitRate)
-    .sort((a, b) => {
-      const ap = Number(a.profitRate || 0);
-      const bp = Number(b.profitRate || 0);
-
-      // 수익률 좋은 종목 우선
-      if (bp !== ap) return bp - ap;
-
-      // 같으면 평가금액 큰 종목 우선
-      return holdingValue(b) - holdingValue(a);
-    })
-    .slice(0, algo.dividendMaxPositions);
-
-  return holdings.map(h => ({
-    type: 'BUY',
-    reason:
-      `배당 강제 추가매수 / ` +
-      `보유 ${h.quantity}주 / ` +
-      `수익률 ${h.profitRate}% / ` +
-      `잔고 ${balance.toLocaleString()}원`,
-    stockId: h.stockId,
-    stockName: h.stockName,
-    quantity: algo.dividendAddBuyQuantity,
-    price: h.currentPrice,
-    score: 999,
-    allowAddToHolding: true,
-  }));
-}
-
 async function mapLimit(items, limit, mapper) {
   const results = new Array(items.length);
   let index = 0;
@@ -950,25 +590,12 @@ async function mapLimit(items, limit, mapper) {
 }
 
 async function getBuySignals(stocks, portfolio, getStockPrices) {
-  const dividendMode = isDividendMode();
   const filterStats = new Map();
+  const threshold = currentScoreThreshold();
 
   cleanupBuyConfirm();
 
-  const forcedDividendSignals = makeDividendForceBuySignals(portfolio);
-
-  if (forcedDividendSignals.length > 0) {
-    console.log(
-      `[DIVIDEND FORCE] 보유 종목 강제 추가매수 후보 ` +
-      `${forcedDividendSignals.length}개 / ` +
-      `signals=${Math.min(forcedDividendSignals.length, algo.maxBuysPerLoop)}`
-    );
-
-    return forcedDividendSignals.slice(0, algo.maxBuysPerLoop);
-  }
-
   const candidates = preFilterCandidates(stocks, portfolio);
-
   const analyzed = await mapLimit(
     candidates,
     algo.priceFetchConcurrency,
@@ -977,237 +604,64 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
         const priceData = await getStockPrices(stock.id, '1h');
         const analysis = analyzePricePoints(priceData.points, stock.currentPrice);
 
-        if (!analysis) return null;
-
-        const {
-          momentum1h,
-          momentumShort,
-          momentumMicro,
-          momentumRecent,
-          pullbackFromHigh,
-          volatility1h,
-          trendConsistency,
-          consecutiveDownTicks,
-          rangePosition,
-        } = analysis;
-
-        const justLive = isLiveJustStarted(stock.id);
-
-        const minMomentum1h = justLive
-          ? Math.max(0, algo.minMomentum1h - algo.liveTransitionRelaxMomentum)
-          : algo.minMomentum1h;
-
-        const minScore = dividendMode
-          ? Math.min(algo.buyScoreThreshold, algo.dividendMinScore)
-          : justLive
-            ? Math.max(5, algo.buyScoreThreshold - algo.liveTransitionRelaxScore)
-            : algo.buyScoreThreshold;
-
-        const momentumOk =
-          momentum1h >= minMomentum1h &&
-          momentum1h <= algo.maxMomentum1h;
-
-        const minRecentMomentum = justLive
-          ? Math.min(0, algo.minRecentMomentum)
-          : algo.minRecentMomentum;
-
-        const minTrendConsistency = justLive
-          ? Math.max(0.4, algo.minTrendConsistency - 0.08)
-          : algo.minTrendConsistency;
-
-        const shortMomentumOk = momentumShort >= config.minShortMomentum;
-        const microMomentumOk = momentumMicro >= algo.minMicroMomentum;
-        const recentMomentumOk = momentumRecent >= minRecentMomentum;
-        const trendOk = trendConsistency >= minTrendConsistency;
-        const downStreakOk = consecutiveDownTicks <= algo.maxConsecutiveDownTicks;
-        const rangePositionOk = rangePosition >= algo.minRangePosition;
-        const overheatOk =
-          justLive ||
-          rangePosition < algo.overheatRangePosition ||
-          momentumMicro <= algo.overheatMicroMomentum;
-        const highChaseOk =
-          justLive ||
-          momentum1h < algo.highChaseMomentum1h ||
-          rangePosition < algo.highChaseRangePosition ||
-          pullbackFromHigh < algo.highChaseMaxPullbackFromHigh;
-        const spikeMomentumOk =
-          dividendMode ||
-          justLive ||
-          (
-            momentumShort <= algo.maxShortMomentum &&
-            momentumMicro <= algo.maxMicroMomentum &&
-            momentumRecent <= algo.maxRecentMomentum
-          );
-        const lateSpikeOk =
-          dividendMode ||
-          justLive ||
-          !(
-            momentum1h >= algo.lateSpikeMomentum1h &&
-            momentumShort >= algo.lateSpikeShortMomentum &&
-            rangePosition >= algo.lateSpikeRangePosition
-          );
-        const volatilityOk = volatility1h <= algo.maxVolatility1h;
-        const pullbackOk = pullbackFromHigh >= algo.maxPullbackFromHigh;
-
-        const failedReasons = [];
-        if (!momentumOk) failedReasons.push('momentum1h');
-        if (!shortMomentumOk) failedReasons.push('short');
-        if (!microMomentumOk) failedReasons.push('micro');
-        if (!recentMomentumOk) failedReasons.push('recent');
-        if (!trendOk) failedReasons.push('trend');
-        if (!downStreakOk) failedReasons.push('downStreak');
-        if (!rangePositionOk) failedReasons.push('rangeLow');
-        if (!highChaseOk) failedReasons.push('highChase');
-        if (!spikeMomentumOk) failedReasons.push('spike');
-        if (!lateSpikeOk) failedReasons.push('lateSpike');
-        if (!overheatOk) failedReasons.push('overheat');
-        if (!volatilityOk) failedReasons.push('volatility');
-        if (!pullbackOk) failedReasons.push('pullback');
-
-        if (failedReasons.length > 0) {
-          const key = failedReasons[0];
-          filterStats.set(key, (filterStats.get(key) || 0) + 1);
+        if (!analysis) {
+          filterStats.set('shortHistory', (filterStats.get('shortHistory') || 0) + 1);
           return null;
         }
 
-        let score = 0;
-        const stockTypeWeight = getStockTypeWeight(stock);
-
-        if (dividendMode) {
-          score += Math.min(momentum1h, algo.maxMomentum1h) * 1.0;
-          score += momentumShort * 2.5;
-          score += momentumMicro * 2.0;
-          score += momentumRecent * 2.2;
-          score += (trendConsistency - 0.5) * 8.0;
-          score += Math.max(0, rangePosition - 0.5) * 2.0;
-        } else {
-          const balancedRangeBonus = Math.max(
-            0,
-            1 - Math.abs(rangePosition - 0.72) / 0.35
-          );
-
-          score += Math.min(momentum1h, algo.maxMomentum1h) * 1.1;
-          score += momentumShort * 1.2;
-          score += momentumMicro * 0.7;
-          score += momentumRecent * 1.3;
-          score += (trendConsistency - 0.5) * 10.0;
-          score += balancedRangeBonus * 3.0;
-          score -= Math.max(0, rangePosition - 0.94) * 8.0;
-        }
-
-        score -= consecutiveDownTicks * 1.3;
-        score += stockTypeWeight;
-        score += stock.changeRate * 0.001;
-
-        if (stock.isLive) {
-          score += algo.liveStockScoreBonus;
-        }
-
-        if (justLive) {
-          score += algo.liveTransitionBoost;
-        }
-
-                let dividendBonusInfo = null;
-
-        if (dividendMode) {
-          score += Math.min(Number(stock.currentPrice || 0) / 20000, 5);
-
-          dividendBonusInfo = getDividendScoreBonus(stock);
-          score += dividendBonusInfo.bonus;
-        }
-
-        if (volatility1h > 12) {
-          score -= (volatility1h - 12) * 0.6;
-        }
-
-        const chopPenalty = Math.max(
-          0,
-          volatility1h - Math.max(4, Math.abs(momentum1h) * 2)
-        );
-
-        score -= chopPenalty * algo.chopPenaltyWeight;
-
-        if (pullbackFromHigh < -0.8) {
-          score -= Math.abs(pullbackFromHigh + 0.8) * 2.0;
-        }
-
-        if (stock.changeRate > 80) {
-          score -= (stock.changeRate - 80) * 0.03;
-        }
-
-        const weakBreakout =
-          !dividendMode &&
-          !justLive &&
-          rangePosition >= algo.breakoutRangePosition &&
-          pullbackFromHigh >= algo.breakoutMaxPullbackFromHigh &&
-          (
-            score < algo.breakoutMinScore ||
-            trendConsistency < algo.breakoutMinTrendConsistency
-          );
-
-        if (weakBreakout) {
-          filterStats.set('weakBreakout', (filterStats.get('weakBreakout') || 0) + 1);
+        const rejectReason = hardRejectReason(stock, analysis);
+        if (rejectReason) {
+          filterStats.set(rejectReason, (filterStats.get(rejectReason) || 0) + 1);
           return null;
         }
 
-        if (score < minScore) {
+        const features = makeFeatures(stock, analysis);
+        const modelScore = weightedScore(features);
+        const explorationScore =
+          Math.random() < algo.explorationRate
+            ? Math.random() * algo.explorationBonus
+            : 0;
+        const finalScore = modelScore + explorationScore;
+
+        if (finalScore < threshold) {
           filterStats.set('score', (filterStats.get('score') || 0) + 1);
           return null;
         }
 
-        const aggressiveDividendMode = isDividendAggressiveMode();
-        const alreadyHolding = makeHoldingMap(portfolio).has(stock.id);
-
-        let targetCash = null;
-        let quantity;
-
-        if (aggressiveDividendMode && alreadyHolding) {
-          quantity = algo.dividendAddBuyQuantity;
-        } else if (dividendMode) {
-          quantity = getAdaptiveBuyQuantity(stock, dividendMode);
-        } else {
-          const sizing = getRegularBuySizing(stock, portfolio);
-          quantity = sizing.quantity;
-          targetCash = sizing.targetCash;
-        }
+        const sizing = learnedBuySizing(stock, portfolio, finalScore, threshold);
+        const stockName = stock.channelName || stock.stockName || stock.name || stock.id;
+        const dividendNote = hasDividendSystemInfo(stock)
+          ? ' / dividendSystem=present'
+          : '';
 
         return {
           type: 'BUY',
-                    reason:
-            `${dividendMode ? '배당+단타' : '공격 모멘텀'} 점수 ${score.toFixed(2)} / ` +
-            `1h ${momentum1h.toFixed(2)}% / ` +
-            `short ${momentumShort.toFixed(2)}% / ` +
-            `micro ${momentumMicro.toFixed(2)}% / ` +
-            `recent ${momentumRecent.toFixed(2)}% / ` +
-            `vol ${volatility1h.toFixed(2)}% / ` +
-            `high ${pullbackFromHigh.toFixed(2)}% / ` +
-            `trend ${(trendConsistency * 100).toFixed(0)}% / ` +
-            `range ${(rangePosition * 100).toFixed(0)}% / ` +
-            `type ${stock.stockType || '-'}` +
-            `${targetCash ? ` / 목표 ${targetCash.toLocaleString()}원` : ''}` +
-            `${dividendBonusInfo && dividendBonusInfo.bonus > 0
-              ? ` / 배당률 ${dividendBonusInfo.rate}% / 배당횟수 ${dividendBonusInfo.count}`
-              : ''}` +
-            `${justLive ? ' / LIVE 전환 감지' : ''}` +
-            `${getLiveAgeText(stock.id)}`,
+          reason:
+            `learn score ${finalScore.toFixed(2)} >= ${threshold.toFixed(2)} / ` +
+            `1h ${analysis.momentum1h.toFixed(2)}% / ` +
+            `short ${analysis.momentumShort.toFixed(2)}% / ` +
+            `micro ${analysis.momentumMicro.toFixed(2)}% / ` +
+            `recent ${analysis.momentumRecent.toFixed(2)}% / ` +
+            `vol ${analysis.volatility1h.toFixed(2)}% / ` +
+            `high ${analysis.pullbackFromHigh.toFixed(2)}% / ` +
+            `trend ${(analysis.trendConsistency * 100).toFixed(0)}% / ` +
+            `range ${(analysis.rangePosition * 100).toFixed(0)}% / ` +
+            `risk ${currentRiskMultiplier().toFixed(2)}` +
+            `${explorationScore > 0 ? ` / explore +${explorationScore.toFixed(2)}` : ''}` +
+            `${dividendNote}`,
           stockId: stock.id,
-          stockName: stock.channelName,
-          quantity,
+          stockName,
+          quantity: sizing.quantity,
           price: stock.currentPrice,
-          score,
-          targetCash,
-          allowAddToHolding: aggressiveDividendMode && alreadyHolding,
-          momentum1h,
-          momentumShort,
-          momentumMicro,
-          momentumRecent,
-          pullbackFromHigh,
-          trendConsistency,
-          rangePosition,
-          justLive,
+          targetCash: sizing.targetCash,
+          score: finalScore,
+          modelScore,
+          explorationScore,
+          features,
+          analysis,
         };
       } catch (err) {
-        console.log(`[PRICE ERROR] ${stock.channelName} / ${err.message}`);
+        console.log(`[PRICE ERROR] ${stock.channelName || stock.id} / ${err.message}`);
         return null;
       }
     }
@@ -1219,27 +673,17 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
     .slice(0, algo.confirmCandidatesN);
 
   const signals = [];
-  const reservedRotationIds = new Set();
 
   for (let i = 0; i < ranked.length; i++) {
-    let signal = ranked[i];
-
+    const signal = ranked[i];
     const confirmCount = updateBuyConfirm(signal.stockId);
 
     if (confirmCount < algo.buyConfirmCount) {
       if (i < algo.waitLogTopN) {
         console.log(
-          `[BUY WAIT] ${signal.stockName} ` +
+          `[LEARN BUY WAIT] ${signal.stockName} ` +
           `${confirmCount}/${algo.buyConfirmCount} / ` +
-          `score ${signal.score.toFixed(2)} / ` +
-          `1h ${signal.momentum1h.toFixed(2)}% / ` +
-          `short ${signal.momentumShort.toFixed(2)}% / ` +
-          `micro ${signal.momentumMicro.toFixed(2)}% / ` +
-          `recent ${signal.momentumRecent.toFixed(2)}% / ` +
-          `high ${signal.pullbackFromHigh.toFixed(2)}% / ` +
-          `trend ${(signal.trendConsistency * 100).toFixed(0)}% / ` +
-          `range ${(signal.rangePosition * 100).toFixed(0)}%` +
-          `${signal.justLive ? ' / LIVE 전환' : ''}`
+          `score ${signal.score.toFixed(2)} / threshold ${threshold.toFixed(2)}`
         );
       }
 
@@ -1247,27 +691,15 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
     }
 
     buyConfirmMap.delete(signal.stockId);
-
-    const rotationHolding = selectRotationExitHolding(
-      portfolio,
-      signal,
-      reservedRotationIds
-    );
-
-    if (rotationHolding) {
-      reservedRotationIds.add(rotationHolding.stockId);
-      signal = addRotationPlan(signal, rotationHolding);
-    }
-
     signals.push(signal);
 
-    if (signals.length >= algo.maxBuysPerLoop) {
-      break;
-    }
+    if (signals.length >= algo.maxBuysPerLoop) break;
   }
 
   console.log(
-    `[BUY DEBUG] candidates=${candidates.length} / ranked=${ranked.length} / signals=${signals.length} / dividendMode=${dividendMode}`
+    `[LEARN BUY DEBUG] candidates=${candidates.length} / ` +
+    `ranked=${ranked.length} / signals=${signals.length} / ` +
+    `threshold=${threshold.toFixed(2)} / risk=${currentRiskMultiplier().toFixed(2)}`
   );
 
   if (candidates.length > 0 && ranked.length === 0 && filterStats.size > 0) {
@@ -1277,32 +709,273 @@ async function getBuySignals(stocks, portfolio, getStockPrices) {
       .map(([key, count]) => `${key}:${count}`)
       .join(' / ');
 
-    console.log(`[BUY FILTER] ${topFilters}`);
+    console.log(`[LEARN BUY FILTER] ${topFilters}`);
   }
 
   return signals;
+}
+
+function makeSellSignal(holding, reason, extra = {}) {
+  return {
+    type: 'SELL',
+    reason,
+    stockId: holding.stockId,
+    stockName: holding.stockName,
+    quantity: holding.quantity,
+    profitRate: cleanNumber(holding.profitRate),
+    ...extra,
+  };
+}
+
+function getSellSignals(portfolio) {
+  const signals = [];
+  const currentHoldingIds = new Set();
+
+  for (const holding of portfolio.holdings || []) {
+    const stockId = holding.stockId;
+    currentHoldingIds.add(stockId);
+
+    const currentPrice = cleanNumber(holding.currentPrice);
+    if (currentPrice <= 0) continue;
+
+    const prevPeak = holdingPeaks.get(stockId) || currentPrice;
+    const newPeak = Math.max(prevPeak, currentPrice);
+    holdingPeaks.set(stockId, newPeak);
+
+    if (!holdingFirstSeenAt.has(stockId)) {
+      holdingFirstSeenAt.set(stockId, Date.now());
+    }
+
+    const holdingMs = Date.now() - holdingFirstSeenAt.get(stockId);
+    const averagePrice = cleanNumber(holding.averagePrice);
+    const profitRate = cleanNumber(holding.profitRate);
+    const peakDrawdown = percentChange(newPeak, currentPrice);
+    const peakProfitRate = averagePrice > 0
+      ? percentChange(averagePrice, newPeak)
+      : Math.max(0, profitRate);
+
+    const stopLoss = algo.stopLossRate * clamp(1 / currentRiskMultiplier(), 0.8, 1.5);
+
+    if (profitRate <= stopLoss) {
+      signals.push(makeSellSignal(
+        holding,
+        `adaptive stop: ${profitRate}% <= ${stopLoss.toFixed(2)}%`,
+        { exitKind: 'stop', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+
+    if (
+      peakProfitRate >= algo.trailingStartRate &&
+      peakDrawdown <= algo.trailingDropRate
+    ) {
+      signals.push(makeSellSignal(
+        holding,
+        `adaptive trailing: peak ${peakProfitRate.toFixed(2)}% / drawdown ${peakDrawdown.toFixed(2)}%`,
+        { exitKind: 'trailing', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+
+    if (profitRate >= algo.takeProfitRate) {
+      signals.push(makeSellSignal(
+        holding,
+        `adaptive take profit: ${profitRate}%`,
+        { exitKind: 'takeProfit', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+
+    if (
+      holdingMs >= algo.earlyStopMinMs &&
+      holdingMs <= algo.earlyStopMs &&
+      profitRate <= algo.earlyStopLossRate
+    ) {
+      signals.push(makeSellSignal(
+        holding,
+        `early failure stop: ${Math.round(holdingMs / 1000)}s / ${profitRate}%`,
+        { exitKind: 'earlyStop', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+
+    if (
+      holdingMs >= config.maxHoldMs &&
+      profitRate >= config.timeExitProfitRate
+    ) {
+      signals.push(makeSellSignal(
+        holding,
+        `time profit exit: ${Math.round(holdingMs / 1000)}s / ${profitRate}%`,
+        { exitKind: 'timeProfit', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+
+    if (
+      holdingMs >= config.maxHoldMs &&
+      profitRate <= config.timeExitLossRate
+    ) {
+      signals.push(makeSellSignal(
+        holding,
+        `time loss exit: ${Math.round(holdingMs / 1000)}s / ${profitRate}%`,
+        { exitKind: 'timeLoss', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+
+    if (
+      holdingMs >= config.maxHoldMs * 2 &&
+      profitRate >= algo.timeExitNeutralRate
+    ) {
+      signals.push(makeSellSignal(
+        holding,
+        `time neutral exit: ${Math.round(holdingMs / 1000)}s / ${profitRate}%`,
+        { exitKind: 'timeNeutral', holdingMs, peakProfitRate, peakDrawdown }
+      ));
+      continue;
+    }
+  }
+
+  for (const stockId of holdingFirstSeenAt.keys()) {
+    if (!currentHoldingIds.has(stockId)) {
+      holdingFirstSeenAt.delete(stockId);
+      holdingPeaks.delete(stockId);
+    }
+  }
+
+  return signals;
+}
+
+function updateWeights(features, reward) {
+  const nextWeights = {
+    ...DEFAULT_WEIGHTS,
+    ...(memory.weights || {}),
+  };
+
+  for (const key of Object.keys(DEFAULT_WEIGHTS)) {
+    const current = cleanNumber(nextWeights[key], DEFAULT_WEIGHTS[key]);
+    const baseline = DEFAULT_WEIGHTS[key];
+    const featureValue = key === 'bias' ? 0.25 : cleanNumber(features[key]);
+    const learned = current + algo.learningRate * reward * featureValue;
+    const decayed = baseline + (learned - baseline) * (1 - algo.weightDecay);
+    nextWeights[key] = clamp(decayed, -4, 5);
+  }
+
+  memory.weights = nextWeights;
+}
+
+function recordClosedTrade(signal, profitRate, reward, openTrade) {
+  memory.closedTrades = [
+    ...(memory.closedTrades || []),
+    {
+      stockId: signal.stockId,
+      stockName: signal.stockName,
+      boughtAt: openTrade?.boughtAt || null,
+      soldAt: new Date().toISOString(),
+      score: openTrade?.score ?? null,
+      profitRate,
+      reward,
+      exitKind: signal.exitKind || 'unknown',
+      reason: signal.reason,
+    },
+  ].slice(-algo.memoryMaxClosedTrades);
+}
+
+function learnFromClosedTrade(signal) {
+  const stockId = String(signal.stockId);
+  const openTrade = memory.openTrades?.[stockId];
+  const profitRate = cleanNumber(
+    signal.executedProfitRate ?? signal.profitRate
+  );
+  const reward = clamp(profitRate / algo.rewardScaleRate, -1.25, 1.25);
+
+  memory.stats.sells += 1;
+  memory.stats.realizedProfitRateSum += profitRate;
+
+  if (profitRate > 0) {
+    memory.stats.wins += 1;
+    memory.stats.winStreak += 1;
+    memory.stats.lossStreak = 0;
+  } else {
+    memory.stats.losses += 1;
+    memory.stats.lossStreak += 1;
+    memory.stats.winStreak = 0;
+  }
+
+  if (openTrade?.features) {
+    updateWeights(openTrade.features, reward);
+  }
+
+  const thresholdDelta = profitRate > 0
+    ? -0.03 * Math.min(1, Math.max(0, reward))
+    : 0.08 * Math.min(1.5, Math.abs(reward));
+
+  memory.scoreThreshold = clamp(
+    cleanNumber(memory.scoreThreshold, algo.baseScoreThreshold) + thresholdDelta,
+    algo.minScoreThreshold,
+    algo.maxScoreThreshold
+  );
+
+  const riskDelta = profitRate > 0
+    ? 0.03 * Math.min(1, reward)
+    : -0.08 * Math.min(1.5, Math.abs(reward));
+
+  memory.riskMultiplier = clamp(
+    cleanNumber(memory.riskMultiplier, 1) + riskDelta,
+    algo.minRiskMultiplier,
+    algo.maxRiskMultiplier
+  );
+
+  recordClosedTrade(signal, profitRate, reward, openTrade);
+
+  if (memory.openTrades) {
+    delete memory.openTrades[stockId];
+  }
+
+  saveMemory();
+
+  console.log(
+    `[LEARN UPDATE] ${signal.stockName} profit=${profitRate.toFixed(2)}% / ` +
+    `reward=${reward.toFixed(2)} / threshold=${memory.scoreThreshold.toFixed(2)} / ` +
+    `risk=${memory.riskMultiplier.toFixed(2)}`
+  );
+}
+
+function recordOpenTrade(signal) {
+  memory.openTrades = memory.openTrades || {};
+  memory.openTrades[String(signal.stockId)] = {
+    stockId: signal.stockId,
+    stockName: signal.stockName,
+    boughtAt: new Date().toISOString(),
+    price: signal.executedPrice ?? signal.price ?? null,
+    quantity: signal.executedQuantity ?? signal.quantity ?? null,
+    score: signal.score ?? null,
+    modelScore: signal.modelScore ?? null,
+    explorationScore: signal.explorationScore ?? 0,
+    features: signal.features || {},
+    analysis: signal.analysis || {},
+  };
+
+  memory.stats.buys += 1;
+  saveMemory();
 }
 
 function markSignalTraded(signal) {
   if (signal.type === 'BUY') {
     lastAnyBuyAt = Date.now();
     markBought(signal.stockId);
+    recordOpenTrade(signal);
     return;
   }
 
   if (signal.type === 'SELL') {
-    const reason = String(signal.reason || '');
+    learnFromClosedTrade(signal);
 
-    if (reason.includes('손절')) {
-      consecutiveLossSells += 1;
-
-      if (consecutiveLossSells >= algo.lossPauseCount) {
-        buyPausedUntil = Date.now() + algo.lossPauseMs;
-        console.log(`[BUY PAUSE] 손절 ${consecutiveLossSells}회 연속 → ${Math.round(algo.lossPauseMs / 1000)}초 매수 중단`);
-        consecutiveLossSells = 0;
-      }
-    } else if (reason.includes('익절')) {
-      consecutiveLossSells = 0;
+    if (memory.stats.lossStreak >= algo.lossPauseCount) {
+      buyPausedUntil = Date.now() + algo.lossPauseMs;
+      memory.stats.lossStreak = 0;
+      saveMemory();
+      console.log(`[LEARN BUY PAUSE] repeated losses, pausing ${Math.round(algo.lossPauseMs / 1000)}s`);
     }
 
     markSold(signal.stockId);

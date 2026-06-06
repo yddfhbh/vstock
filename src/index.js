@@ -28,9 +28,9 @@ function nowText() {
   });
 }
 
-function numberEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) ? value : fallback;
+function toNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }
 
 function shutdown(reason, code = 0) {
@@ -45,25 +45,25 @@ function shutdown(reason, code = 0) {
 }
 
 process.once('SIGINT', () => {
-  shutdown('SIGINT 수신. Ctrl+C 또는 터미널 중단으로 종료됨', 0);
+  shutdown('SIGINT received', 0);
 });
 
 process.once('SIGTERM', () => {
-  shutdown('SIGTERM 수신. 외부 종료 신호로 종료됨', 0);
+  shutdown('SIGTERM received', 0);
 });
 
 process.on('uncaughtException', err => {
   console.error(`[FATAL] uncaughtException: ${err.stack || err.message}`);
-  shutdown('처리되지 않은 예외로 종료됨', 1);
+  shutdown('uncaught exception', 1);
 });
 
 process.on('unhandledRejection', err => {
   console.error(`[FATAL] unhandledRejection: ${err?.stack || err}`);
-  shutdown('처리되지 않은 Promise 거부로 종료됨', 1);
+  shutdown('unhandled rejection', 1);
 });
 
 process.on('beforeExit', code => {
-  console.log(`[SHUTDOWN] 이벤트 루프가 비어서 자연 종료됨 / code=${code}`);
+  console.log(`[SHUTDOWN] event loop became empty / code=${code}`);
 });
 
 async function getScannedStocks() {
@@ -108,143 +108,73 @@ async function getScannedStocks() {
 
 function printStatus(portfolio, stocks) {
   const liveCount = stocks.filter(stock => stock.isLive).length;
+  const balance = toNumber(portfolio.me?.balance);
+  const totalAsset = toNumber(portfolio.me?.totalAsset);
 
   console.log(
-    `\n[${nowText()}] 감시 ${stocks.length}개 / LIVE ${liveCount}개 / ` +
-    `잔고 ${portfolio.me.balance.toLocaleString()}원 / ` +
-    `총자산 ${portfolio.me.totalAsset.toLocaleString()}원`
+    `\n[${nowText()}] scanned ${stocks.length} / LIVE ${liveCount} / ` +
+    `balance ${balance.toLocaleString()} / total ${totalAsset.toLocaleString()}`
   );
 
   if (!portfolio.holdings || portfolio.holdings.length === 0) {
-    console.log('  보유 종목 없음');
+    console.log('  holdings: none');
     return;
   }
 
   for (const holding of portfolio.holdings) {
     console.log(
-      `  보유: ${holding.stockName} ${holding.quantity}주 / ` +
-      `평단 ${holding.averagePrice.toLocaleString()} / ` +
-      `현재 ${holding.currentPrice.toLocaleString()} / ` +
-      `수익률 ${holding.profitRate}%`
+      `  holding: ${holding.stockName} ${holding.quantity} shares / ` +
+      `avg ${toNumber(holding.averagePrice).toLocaleString()} / ` +
+      `now ${toNumber(holding.currentPrice).toLocaleString()} / ` +
+      `profit ${holding.profitRate}%`
     );
   }
 }
 
 async function executeBuySignal(signal) {
-  let freshPortfolio = await getPortfolio();
-  let holdings = freshPortfolio.holdings || [];
+  const freshPortfolio = await getPortfolio();
+  const holdings = freshPortfolio.holdings || [];
+  const alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
 
-  let alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
-
-  if (
-    !alreadyHolding &&
-    holdings.length >= config.maxPositions &&
-    signal.rotateOutStockId
-  ) {
-    const rotateHolding = holdings
-      .find(h => h.stockId === signal.rotateOutStockId);
-
-    if (rotateHolding) {
-      const rotateQuantity = Math.min(
-        Number(signal.rotateOutQuantity || rotateHolding.quantity || 0),
-        Number(rotateHolding.quantity || 0)
-      );
-
-      if (rotateQuantity > 0) {
-        console.log(
-          `[ROTATE SELL] ${rotateHolding.stockName} ${rotateQuantity}주 / ` +
-          `${signal.stockName} 매수 슬롯 확보 / ` +
-          `현재 수익률 ${rotateHolding.profitRate}%`
-        );
-
-        await sellStock(rotateHolding.stockId, rotateQuantity);
-        markSignalTraded({
-          type: 'SELL',
-          reason:
-            `로테이션 매도: ${signal.stockName} 신규매수 / ` +
-            `${rotateHolding.profitRate}%`,
-          stockId: rotateHolding.stockId,
-          stockName: rotateHolding.stockName,
-          quantity: rotateQuantity,
-        });
-
-        await sleep(500);
-
-        freshPortfolio = await getPortfolio();
-        holdings = freshPortfolio.holdings || [];
-        alreadyHolding = holdings.some(h => h.stockId === signal.stockId);
-      }
-    } else {
-      console.log(
-        `[ROTATE SKIP] 교체 대상 보유 중 아님: ` +
-        `${signal.rotateOutStockName || signal.rotateOutStockId}`
-      );
-    }
-  }
-
-  // 이미 보유 중인 종목 추가매수는 maxPositions 체크에서 제외
-  if (!alreadyHolding && holdings.length >= config.maxPositions) {
-    console.log(
-      `[BUY SKIP] 최대 보유 종목 수 도달: ` +
-      `${holdings.length}/${config.maxPositions}`
-    );
+  if (alreadyHolding) {
+    console.log(`[BUY SKIP] already holding ${signal.stockName}`);
     return;
   }
 
-  // 일반 모드에서는 같은 종목 추가매수 금지
-  // 배당 공격 모드에서 allowAddToHolding=true일 때만 추가매수 허용
-  if (alreadyHolding && !signal.allowAddToHolding) {
-    console.log(`[BUY SKIP] 이미 보유 중: ${signal.stockName}`);
-    return;
-  }
-
-  if (alreadyHolding && signal.allowAddToHolding) {
+  if (holdings.length >= config.maxPositions) {
     console.log(
-      `[DIVIDEND ADD BUY] 이미 보유 중이지만 배당 모드 추가매수 허용: ` +
-      `${signal.stockName}`
+      `[BUY SKIP] max positions reached: ${holdings.length}/${config.maxPositions}`
     );
+    return;
   }
 
   const freshStock = await getStockDetail(signal.stockId);
+  const balance = toNumber(freshPortfolio.me?.balance);
+  const currentPrice = toNumber(freshStock.currentPrice || signal.price);
 
-  const balance = Number(freshPortfolio.me.balance || 0);
-  const currentPrice = Number(freshStock.currentPrice || signal.price || 0);
-
-  if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
-    console.log(`[BUY SKIP] 현재가 이상함: ${signal.stockName} / ${currentPrice}`);
+  if (currentPrice <= 0) {
+    console.log(`[BUY SKIP] invalid current price: ${signal.stockName} / ${currentPrice}`);
     return;
   }
 
-  // 배당 추가매수 신호면 배당용 현금/거래한도 사용
-  const cashReserve = signal.allowAddToHolding
-    ? numberEnv('DIVIDEND_CASH_RESERVE', config.buyCashReserve)
-    : config.buyCashReserve;
-
-  const buyCashRate = signal.allowAddToHolding
-    ? numberEnv('DIVIDEND_MAX_BUY_CASH_PER_TRADE_RATE', config.maxBuyCashPerTradeRate)
-    : config.maxBuyCashPerTradeRate;
-
-  const usableCash = Math.max(0, balance - cashReserve);
+  const usableCash = Math.max(0, balance - config.buyCashReserve);
 
   if (usableCash <= 0) {
     console.log(
-      `[BUY SKIP] 사용 가능 현금 없음: ` +
-      `잔고 ${balance.toLocaleString()}원 / ` +
-      `예비현금 ${cashReserve.toLocaleString()}원`
+      `[BUY SKIP] no usable cash: balance ${balance.toLocaleString()} / ` +
+      `reserve ${config.buyCashReserve.toLocaleString()}`
     );
     return;
   }
 
   const maxTradeCash = Math.floor(
-    usableCash * (buyCashRate / 100)
+    usableCash * (config.maxBuyCashPerTradeRate / 100)
   );
 
   if (maxTradeCash < config.minBuyCash) {
     console.log(
-      `[BUY SKIP] 매수 가능 현금이 너무 적음: ` +
-      `사용가능 ${usableCash.toLocaleString()}원 / ` +
-      `거래한도 ${maxTradeCash.toLocaleString()}원 / ` +
-      `최소 ${config.minBuyCash.toLocaleString()}원`
+      `[BUY SKIP] trade cash too small: usable ${usableCash.toLocaleString()} / ` +
+      `limit ${maxTradeCash.toLocaleString()} / min ${config.minBuyCash.toLocaleString()}`
     );
     return;
   }
@@ -252,17 +182,13 @@ async function executeBuySignal(signal) {
   const bufferedPrice = Math.ceil(
     currentPrice * (1 + config.buyPriceBufferRate / 100)
   );
-
   const affordableQuantityByBalance = Math.floor(usableCash / bufferedPrice);
   const affordableQuantityByLimit = Math.floor(maxTradeCash / bufferedPrice);
 
-  const targetCash = Number(signal.targetCash || 0);
+  const targetCash = toNumber(signal.targetCash);
   const targetQuantity = targetCash > 0
-    ? Math.max(
-        Number(signal.quantity || 0),
-        Math.round(targetCash / currentPrice)
-      )
-    : Number(signal.quantity || 0);
+    ? Math.max(toNumber(signal.quantity), Math.round(targetCash / currentPrice))
+    : toNumber(signal.quantity);
 
   const finalQuantity = Math.min(
     targetQuantity,
@@ -272,27 +198,26 @@ async function executeBuySignal(signal) {
 
   if (finalQuantity <= 0) {
     console.log(
-      `[BUY SKIP] 거래한도 또는 잔액 부족: ` +
-      `잔고 ${balance.toLocaleString()}원 / ` +
-      `현재가 ${currentPrice.toLocaleString()}원 / ` +
-      `버퍼가 ${bufferedPrice.toLocaleString()}원 / ` +
-      `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
-      `거래한도 ${maxTradeCash.toLocaleString()}원`
+      `[BUY SKIP] insufficient cash: balance ${balance.toLocaleString()} / ` +
+      `price ${currentPrice.toLocaleString()} / buffered ${bufferedPrice.toLocaleString()} / ` +
+      `usable ${usableCash.toLocaleString()} / limit ${maxTradeCash.toLocaleString()}`
     );
     return;
   }
 
   console.log(
-    `[BUY FINAL] ${signal.stockName} ${finalQuantity}주 / ` +
-    `현재가 ${currentPrice.toLocaleString()}원 / ` +
-    `사용가능현금 ${usableCash.toLocaleString()}원 / ` +
-    `거래한도 ${maxTradeCash.toLocaleString()}원` +
-    `${targetCash > 0 ? ` / 목표금액 ${targetCash.toLocaleString()}원` : ''}` +
-    `${signal.allowAddToHolding ? ' / 배당 추가매수' : ''}`
+    `[BUY FINAL] ${signal.stockName} ${finalQuantity} shares / ` +
+    `price ${currentPrice.toLocaleString()} / usable ${usableCash.toLocaleString()} / ` +
+    `limit ${maxTradeCash.toLocaleString()}` +
+    `${targetCash > 0 ? ` / target ${targetCash.toLocaleString()}` : ''}`
   );
 
   await buyStock(signal.stockId, finalQuantity);
-  markSignalTraded(signal);
+  markSignalTraded({
+    ...signal,
+    executedPrice: currentPrice,
+    executedQuantity: finalQuantity,
+  });
 }
 
 async function executeSellSignal(signal) {
@@ -301,30 +226,39 @@ async function executeSellSignal(signal) {
     .find(h => h.stockId === signal.stockId);
 
   if (!holding) {
-    console.log(`[SELL SKIP] 보유 중 아님: ${signal.stockName}`);
+    console.log(`[SELL SKIP] not holding: ${signal.stockName}`);
     return;
   }
 
-  const finalQuantity = Math.min(signal.quantity, holding.quantity);
+  const finalQuantity = Math.min(
+    toNumber(signal.quantity),
+    toNumber(holding.quantity)
+  );
 
   if (finalQuantity <= 0) {
-    console.log(`[SELL SKIP] 매도 가능 수량 없음: ${signal.stockName}`);
+    console.log(`[SELL SKIP] no quantity to sell: ${signal.stockName}`);
     return;
   }
 
+  const executedProfitRate = toNumber(holding.profitRate, toNumber(signal.profitRate));
+
   console.log(
-    `[SELL FINAL] ${signal.stockName} ${finalQuantity}주 / ` +
-    `현재 수익률 ${holding.profitRate}%`
+    `[SELL FINAL] ${signal.stockName} ${finalQuantity} shares / ` +
+    `profit ${executedProfitRate}%`
   );
 
   await sellStock(signal.stockId, finalQuantity);
-  markSignalTraded(signal);
+  markSignalTraded({
+    ...signal,
+    executedProfitRate,
+    executedQuantity: finalQuantity,
+  });
 }
 
 async function executeSignal(signal) {
   console.log(
-    `[SIGNAL] ${signal.type} ${signal.stockName} ${signal.quantity}주 / ` +
-    `이유: ${signal.reason}`
+    `[SIGNAL] ${signal.type} ${signal.stockName} ${signal.quantity} shares / ` +
+    `reason: ${signal.reason}`
   );
 
   if (signal.type === 'BUY') {
@@ -337,12 +271,12 @@ async function executeSignal(signal) {
     return;
   }
 
-  console.log(`[WARN] 알 수 없는 signal type: ${signal.type}`);
+  console.log(`[WARN] unknown signal type: ${signal.type}`);
 }
 
 async function mainLoop() {
   if (isLoopRunning) {
-    console.log('[SKIP] 이전 루프가 아직 실행 중이라 이번 루프는 건너뜀');
+    console.log('[SKIP] previous loop is still running');
     return;
   }
 
@@ -360,16 +294,14 @@ async function mainLoop() {
       await sleep(500);
     }
 
-    // 매도 후 포트폴리오 갱신해서 매수 판단
     const latestPortfolio = await getPortfolio();
-
     const buySignals = await getBuySignals(stocks, latestPortfolio, getStockPrices);
     for (const signal of buySignals) {
       await executeSignal(signal);
       await sleep(500);
     }
   } catch (err) {
-    console.error(`[ERROR] ${err.message}`);
+    console.error(`[ERROR] ${err.stack || err.message}`);
   } finally {
     isLoopRunning = false;
   }
@@ -385,6 +317,7 @@ async function start() {
   console.log(`MAX_POSITIONS=${config.maxPositions}`);
   console.log(`MAX_BUY_CASH_PER_TRADE_RATE=${config.maxBuyCashPerTradeRate}`);
   console.log(`MIN_BUY_CASH=${config.minBuyCash}`);
+  console.log(`DIVIDEND_SYSTEM_AVAILABLE=${config.dividendSystemAvailable}`);
 
   await mainLoop();
 
